@@ -1,0 +1,17 @@
+.{
+    .name = .infer_cpu,
+    .fingerprint = 0x364a5389ce68edc1,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .infer_base = .{
+            .url = "git+https://github.com/infer-zero/base#546479502a9f0e690b1d783c2644462772fb537d",
+            .hash = "infer_base-0.1.0-cgr38j7dAABysiSXIMgChqL_JaFrOnSWdZUZkLJ2oc0h",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
