@@ -1,7 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
-const Tensor = @import("base").Tensor;
-const DataType = Tensor.DataType;
+
+pub const DataType = enum { FP32, FP16, BF16 };
 
 const Pool = std.Thread.Pool;
 const WaitGroup = std.Thread.WaitGroup;
@@ -58,7 +58,6 @@ pub fn matmul(
             const w: [*]const u16 = @as([]const u16, @alignCast(std.mem.bytesAsSlice(u16, w_bytes))).ptr;
             dispatchMatmul(u16, input, output, w, in_dim, out_dim, batch_size, pool);
         },
-        else => unreachable,
     }
 }
 
@@ -91,7 +90,6 @@ pub fn matmulSiluHadamard(
             const uw: [*]const u16 = @as([]const u16, @alignCast(std.mem.bytesAsSlice(u16, up_w))).ptr;
             dispatchFusedFFN(u16, input, output, gw, uw, in_dim, out_dim, batch_size, pool);
         },
-        else => unreachable,
     }
 }
 

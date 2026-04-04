@@ -3,12 +3,7 @@
     .fingerprint = 0x364a5389ce68edc1,
     .version = "0.1.0",
     .minimum_zig_version = "0.15.2",
-    .dependencies = .{
-        .infer_base = .{
-            .url = "git+https://github.com/infer-zero/base#5d437343ca3a1553fb1f5b5c7abd255241b70382",
-            .hash = "infer_base-0.1.0-cgr38sXkAABeUdTtV9uY1Cn5RtOTKZaSxCl77sqBFTLs",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
