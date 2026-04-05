@@ -49,13 +49,27 @@ pub fn rope(
     head_dim: usize,
     num_heads: usize,
 ) void {
+    ropePartial(data, cos, sin, head_dim, head_dim, num_heads);
+}
+
+/// Like rope, but only rotates the first `rotary_dim` elements of each head.
+/// Elements beyond rotary_dim are left unchanged. When rotary_dim == head_dim,
+/// this is identical to rope().
+pub fn ropePartial(
+    data: []f32,
+    cos: []const f32,
+    sin: []const f32,
+    head_dim: usize,
+    rotary_dim: usize,
+    num_heads: usize,
+) void {
     @setFloatMode(.optimized);
-    const half_dim = head_dim / 2;
+    const half_rotary = rotary_dim / 2;
     for (0..num_heads) |head| {
         const base = head * head_dim;
-        const first_half = data[base..][0..half_dim];
-        const second_half = data[base + half_dim ..][0..half_dim];
-        for (0..half_dim) |dim_index| {
+        const first_half = data[base..][0..half_rotary];
+        const second_half = data[base + half_rotary ..][0..half_rotary];
+        for (0..half_rotary) |dim_index| {
             const first = first_half[dim_index];
             const second = second_half[dim_index];
             first_half[dim_index] = first * cos[dim_index] - second * sin[dim_index];
