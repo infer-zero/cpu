@@ -6,12 +6,18 @@ const WaitGroup = std.Thread.WaitGroup;
 // ---- Element-wise operations ----
 
 pub fn rmsNorm(state: []f32, weights: []const f32, epsilon: f32) void {
-    var sum_sq: f32 = 0.0;
+    // Accumulate sum-of-squares in f64 to match llama.cpp's `ggml_float`
+    // (typedef'd to double). f32 accumulation drifts enough across many
+    // layers to flip greedy argmax after ~25-30 decode tokens on
+    // Qwen3-0.6B-Q8_0; doubling precision here matches llama.cpp's
+    // logit ordering.
+    var sum_sq: f64 = 0.0;
     {
         @setFloatMode(.optimized);
-        for (state) |value| sum_sq += value * value;
+        for (state) |value| sum_sq += @as(f64, value) * @as(f64, value);
     }
-    const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(state.len)) + epsilon);
+    const mean: f64 = sum_sq / @as(f64, @floatFromInt(state.len));
+    const inv_rms: f32 = @floatCast(1.0 / @sqrt(mean + @as(f64, epsilon)));
     {
         @setFloatMode(.optimized);
         for (state, weights) |*state_val, weight_val| {
@@ -33,9 +39,10 @@ pub fn rmsNormPerHead(
     for (0..num_heads) |head| {
         const base = head * head_dim;
         const head_slice = data[base..][0..head_dim];
-        var sum_sq: f32 = 0.0;
-        for (head_slice) |value| sum_sq += value * value;
-        const inv_rms = 1.0 / @sqrt(sum_sq / @as(f32, @floatFromInt(head_dim)) + epsilon);
+        var sum_sq: f64 = 0.0;
+        for (head_slice) |value| sum_sq += @as(f64, value) * @as(f64, value);
+        const mean: f64 = sum_sq / @as(f64, @floatFromInt(head_dim));
+        const inv_rms: f32 = @floatCast(1.0 / @sqrt(mean + @as(f64, epsilon)));
         for (head_slice, norm_weights[0..head_dim]) |*sv, wv| {
             sv.* = sv.* * inv_rms * wv;
         }
@@ -103,14 +110,17 @@ pub fn softmax(scores: []f32) void {
     var max_val: f32 = scores[0];
     for (scores[1..]) |score| max_val = @max(max_val, score);
 
-    var sum_exp: f32 = 0.0;
+    // Accumulate in f64 to match llama.cpp's `ggml_float` (double) softmax
+    // sum — matters for long contexts where many small exp() values sum
+    // and f32 rounding flips attention weights enough to drift logits.
+    var sum_exp: f64 = 0.0;
     for (scores) |*score| {
         score.* = @exp(score.* - max_val);
-        sum_exp += score.*;
+        sum_exp += @as(f64, score.*);
     }
 
     if (sum_exp > 0.0) {
-        const inv = 1.0 / sum_exp;
+        const inv: f32 = @floatCast(1.0 / sum_exp);
         for (scores) |*score| score.* *= inv;
     }
 }
