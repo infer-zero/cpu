@@ -107,6 +107,33 @@ pub fn scaledAdd(
     }
 }
 
+/// Weighted sum of `weights.len` position vectors into `output`.
+/// Equivalent to:
+///   @memset(output, 0);
+///   for (weights, 0..) |w, pos| {
+///       for (output, 0..) |*o, i| o.* += values[pos * stride + offset + i] * w;
+///   }
+/// but with the inner sum accumulated in f64 per element — avoids the
+/// f32 drift that builds up across many attended positions in attention
+/// V·weights. Mirrors the `dot`/`rmsNorm`/`softmax` f64 accumulator
+/// pattern used elsewhere in this file.
+pub fn weightedSumF32(
+    output: []f32,
+    values: []const f32,
+    stride: usize,
+    offset: usize,
+    weights: []const f32,
+) void {
+    const dim = output.len;
+    for (0..dim) |i| {
+        var acc: f64 = 0;
+        for (weights, 0..) |w, pos| {
+            acc += @as(f64, values[pos * stride + offset + i]) * @as(f64, w);
+        }
+        output[i] = @floatCast(acc);
+    }
+}
+
 pub fn softmax(scores: []f32) void {
     @setFloatMode(.optimized);
     var max_val: f32 = scores[0];
