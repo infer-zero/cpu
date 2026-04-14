@@ -450,6 +450,432 @@ pub fn matmulSiluHadamardQ8(
     );
 }
 
+// ---- R4 matmul (4-row interleaved Q4_K) ----
+
+/// Repack Q4_K weights from row-major to R4 (4-row interleaved) layout.
+/// Groups of 4 rows have their super-blocks interleaved at block granularity.
+/// Caller must free the returned slice. Frees the input `raw` slice.
+pub fn repackQ4KR4(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) ![]const u8 {
+    const num_super_blocks = in_dim / Q4K_BLOCK_SIZE;
+    const row_bytes = num_super_blocks * Q4K_BLOCK_BYTES;
+    const padded_out_dim = (out_dim + 3) / 4 * 4;
+    const num_groups = padded_out_dim / 4;
+
+    const result = try allocator.alloc(u8, padded_out_dim * row_bytes);
+    @memset(result, 0);
+
+    for (0..num_groups) |group| {
+        for (0..num_super_blocks) |sb_pos| {
+            const dst_offset = (group * num_super_blocks + sb_pos) * (4 * Q4K_BLOCK_BYTES);
+            for (0..4) |row_in_group| {
+                const row = group * 4 + row_in_group;
+                const dst = result[dst_offset + row_in_group * Q4K_BLOCK_BYTES ..][0..Q4K_BLOCK_BYTES];
+                if (row < out_dim) {
+                    const src_offset = row * row_bytes + sb_pos * Q4K_BLOCK_BYTES;
+                    @memcpy(dst, raw[src_offset..][0..Q4K_BLOCK_BYTES]);
+                }
+            }
+        }
+    }
+
+    allocator.free(@constCast(raw));
+    return result;
+}
+
+/// Matmul with R4-interleaved Q4_K weights: quantizes f32 input, then dispatches R4 kernel.
+pub fn matmulR4(
+    pool: ?*Pool,
+    input: []const f32,
+    w_bytes: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+    q_vals: []i8,
+    q_scales: []f32,
+) void {
+    const num_blocks = in_dim / 32;
+    for (0..batch_size) |token| {
+        quantizeF32ToQ8(
+            input[token * in_dim ..][0..in_dim],
+            q_vals[token * in_dim ..][0..in_dim],
+            q_scales[token * num_blocks ..][0..num_blocks],
+        );
+    }
+    matmulQ8R4(pool, q_vals, q_scales, w_bytes, output, in_dim, out_dim, batch_size);
+}
+
+/// Matmul with pre-quantized i8 input and R4-interleaved Q4_K weights.
+pub fn matmulQ8R4(
+    pool: ?*Pool,
+    q_vals: []const i8,
+    q_scales: []const f32,
+    w_bytes: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+) void {
+    const num_q8_blocks = in_dim / 32;
+    const num_super_blocks = in_dim / Q4K_BLOCK_SIZE;
+    const num_groups = (out_dim + 3) / 4;
+    const num_tiles = num_groups;
+
+    // Precompute Q8 block sums for all tokens.
+    var block_sums_buf: [max_batch_size * max_num_q8_blocks]f32 = undefined;
+    for (0..batch_size) |token| {
+        precomputeQ8BlockSums(
+            q_vals[token * num_q8_blocks * 32 ..].ptr,
+            num_q8_blocks,
+            block_sums_buf[token * num_q8_blocks ..].ptr,
+        );
+    }
+    const block_sums: []const f32 = block_sums_buf[0 .. batch_size * num_q8_blocks];
+
+    const Kernel = struct {
+        fn run(
+            quantized_vals: []const i8,
+            quantized_scales: []const f32,
+            q8_block_sums: []const f32,
+            out: []f32,
+            weights: []const u8,
+            output_dim: usize,
+            batch: usize,
+            n_q8_blocks: usize,
+            n_super_blocks: usize,
+            start_tile: usize,
+            end_tile: usize,
+            total_groups: usize,
+        ) void {
+            _ = total_groups;
+            for (start_tile..end_tile) |group| {
+                const base_row = group * 4;
+                const group_ptr = weights.ptr + group * n_super_blocks * (4 * Q4K_BLOCK_BYTES);
+
+                var token: usize = 0;
+                while (token + 1 < batch) : (token += 2) {
+                    const results = dotQ4_K_q8_R4x2(
+                        quantized_vals[token * n_q8_blocks * 32 ..].ptr,
+                        quantized_scales[token * n_q8_blocks ..].ptr,
+                        q8_block_sums[token * n_q8_blocks ..].ptr,
+                        quantized_vals[(token + 1) * n_q8_blocks * 32 ..].ptr,
+                        quantized_scales[(token + 1) * n_q8_blocks ..].ptr,
+                        q8_block_sums[(token + 1) * n_q8_blocks ..].ptr,
+                        group_ptr,
+                        n_super_blocks,
+                    );
+                    inline for (0..4) |r| {
+                        if (base_row + r < output_dim) {
+                            out[token * output_dim + base_row + r] = results[0][r];
+                            out[(token + 1) * output_dim + base_row + r] = results[1][r];
+                        }
+                    }
+                }
+                if (token < batch) {
+                    const results = dotQ4_K_q8_R4(
+                        quantized_vals[token * n_q8_blocks * 32 ..].ptr,
+                        quantized_scales[token * n_q8_blocks ..].ptr,
+                        q8_block_sums[token * n_q8_blocks ..].ptr,
+                        group_ptr,
+                        n_super_blocks,
+                    );
+                    inline for (0..4) |r| {
+                        if (base_row + r < output_dim) {
+                            out[token * output_dim + base_row + r] = results[r];
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    if (pool) |p| {
+        if (num_tiles >= 2) {
+            const num_threads = p.threads.len + 1;
+            const base = num_tiles / num_threads;
+            const extra = num_tiles % num_threads;
+            var wg: WaitGroup = .{};
+            var start: usize = 0;
+            for (0..num_threads) |thread_index| {
+                const count = base + @intFromBool(thread_index < extra);
+                if (count > 0) {
+                    p.spawnWg(&wg, Kernel.run, .{
+                        q_vals, q_scales, block_sums, output, w_bytes,
+                        out_dim, batch_size,
+                        num_q8_blocks, num_super_blocks,
+                        start, start + count, num_groups,
+                    });
+                    start += count;
+                }
+            }
+            p.waitAndWork(&wg);
+            return;
+        }
+    }
+    Kernel.run(
+        q_vals, q_scales, block_sums, output, w_bytes,
+        out_dim, batch_size,
+        num_q8_blocks, num_super_blocks,
+        0, num_tiles, num_groups,
+    );
+}
+
+/// Fused gate+up with SiLU*hadamard using R4-interleaved Q4_K weights.
+pub fn matmulSiluHadamardR4(
+    pool: ?*Pool,
+    input: []const f32,
+    gate_weights: []const u8,
+    up_weights: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+    q_vals: []i8,
+    q_scales: []f32,
+) void {
+    const num_blocks = in_dim / 32;
+    for (0..batch_size) |token| {
+        quantizeF32ToQ8(
+            input[token * in_dim ..][0..in_dim],
+            q_vals[token * in_dim ..][0..in_dim],
+            q_scales[token * num_blocks ..][0..num_blocks],
+        );
+    }
+    matmulSiluHadamardQ8R4(pool, q_vals, q_scales, gate_weights, up_weights, output, in_dim, out_dim, batch_size);
+}
+
+/// Fused gate+up with SiLU*hadamard using pre-quantized i8 input and R4-interleaved Q4_K weights.
+pub fn matmulSiluHadamardQ8R4(
+    pool: ?*Pool,
+    q_vals: []const i8,
+    q_scales: []const f32,
+    gate_weights: []const u8,
+    up_weights: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+) void {
+    const num_q8_blocks = in_dim / 32;
+    const num_super_blocks = in_dim / Q4K_BLOCK_SIZE;
+    const num_groups = (out_dim + 3) / 4;
+    const num_tiles = num_groups;
+
+    // Precompute Q8 block sums for all tokens.
+    var block_sums_buf: [max_batch_size * max_num_q8_blocks]f32 = undefined;
+    for (0..batch_size) |token| {
+        precomputeQ8BlockSums(
+            q_vals[token * num_q8_blocks * 32 ..].ptr,
+            num_q8_blocks,
+            block_sums_buf[token * num_q8_blocks ..].ptr,
+        );
+    }
+    const block_sums: []const f32 = block_sums_buf[0 .. batch_size * num_q8_blocks];
+
+    const Kernel = struct {
+        fn run(
+            quantized_vals: []const i8,
+            quantized_scales: []const f32,
+            q8_block_sums: []const f32,
+            out: []f32,
+            gate_w: []const u8,
+            up_w: []const u8,
+            output_dim: usize,
+            batch: usize,
+            n_q8_blocks: usize,
+            n_super_blocks: usize,
+            start_tile: usize,
+            end_tile: usize,
+        ) void {
+            for (start_tile..end_tile) |group| {
+                const base_row = group * 4;
+                const gate_group_ptr = gate_w.ptr + group * n_super_blocks * (4 * Q4K_BLOCK_BYTES);
+                const up_group_ptr = up_w.ptr + group * n_super_blocks * (4 * Q4K_BLOCK_BYTES);
+
+                var token: usize = 0;
+                while (token + 1 < batch) : (token += 2) {
+                    const v0 = quantized_vals[token * n_q8_blocks * 32 ..].ptr;
+                    const s0 = quantized_scales[token * n_q8_blocks ..].ptr;
+                    const bs0 = q8_block_sums[token * n_q8_blocks ..].ptr;
+                    const v1 = quantized_vals[(token + 1) * n_q8_blocks * 32 ..].ptr;
+                    const s1 = quantized_scales[(token + 1) * n_q8_blocks ..].ptr;
+                    const bs1 = q8_block_sums[(token + 1) * n_q8_blocks ..].ptr;
+                    const gate_results = dotQ4_K_q8_R4x2(v0, s0, bs0, v1, s1, bs1, gate_group_ptr, n_super_blocks);
+                    const up_results = dotQ4_K_q8_R4x2(v0, s0, bs0, v1, s1, bs1, up_group_ptr, n_super_blocks);
+                    inline for (0..2) |t| {
+                        inline for (0..4) |r| {
+                            if (base_row + r < output_dim) {
+                                const gate = gate_results[t][r];
+                                out[(token + t) * output_dim + base_row + r] = common.silu(gate) * up_results[t][r];
+                            }
+                        }
+                    }
+                }
+                if (token < batch) {
+                    const v = quantized_vals[token * n_q8_blocks * 32 ..].ptr;
+                    const s = quantized_scales[token * n_q8_blocks ..].ptr;
+                    const bs = q8_block_sums[token * n_q8_blocks ..].ptr;
+                    const gate_results = dotQ4_K_q8_R4(v, s, bs, gate_group_ptr, n_super_blocks);
+                    const up_results = dotQ4_K_q8_R4(v, s, bs, up_group_ptr, n_super_blocks);
+                    inline for (0..4) |r| {
+                        if (base_row + r < output_dim) {
+                            out[token * output_dim + base_row + r] = common.silu(gate_results[r]) * up_results[r];
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    if (pool) |p| {
+        if (num_tiles >= 2) {
+            const num_threads = p.threads.len + 1;
+            const base = num_tiles / num_threads;
+            const extra = num_tiles % num_threads;
+            var wg: WaitGroup = .{};
+            var start: usize = 0;
+            for (0..num_threads) |thread_index| {
+                const count = base + @intFromBool(thread_index < extra);
+                if (count > 0) {
+                    p.spawnWg(&wg, Kernel.run, .{
+                        q_vals, q_scales, block_sums, output, gate_weights, up_weights,
+                        out_dim, batch_size,
+                        num_q8_blocks, num_super_blocks,
+                        start, start + count,
+                    });
+                    start += count;
+                }
+            }
+            p.waitAndWork(&wg);
+            return;
+        }
+    }
+    Kernel.run(
+        q_vals, q_scales, block_sums, output, gate_weights, up_weights,
+        out_dim, batch_size,
+        num_q8_blocks, num_super_blocks,
+        0, num_tiles,
+    );
+}
+
+/// 4-row R4 dot product kernel for Q4_K weights.
+/// Returns 4 dot products (one per row in the group).
+/// Input Q8 blocks are loaded once and reused across all 4 weight rows.
+inline fn dotQ4_K_q8_R4(
+    noalias x_vals: [*]const i8,
+    noalias x_scales: [*]const f32,
+    noalias x_block_sums: [*]const f32,
+    noalias group_ptr: [*]const u8,
+    num_super_blocks: usize,
+) [4]f32 {
+    @setFloatMode(.optimized);
+    @setEvalBranchQuota(50000);
+    const zero_i32: @Vector(8, i32) = @splat(0);
+
+    var acc: [4]f32 = .{ 0, 0, 0, 0 };
+
+    for (0..num_super_blocks) |sb| {
+        const x_base = sb * 8;
+
+        inline for (0..4) |row| {
+            const block_ptr = group_ptr + sb * (4 * Q4K_BLOCK_BYTES) + row * Q4K_BLOCK_BYTES;
+
+            const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[0..2], .little))));
+            const dmin: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[2..4], .little))));
+            const sm = unpackScales(block_ptr[4..16]);
+            const qs = block_ptr + Q4K_HEADER_BYTES;
+
+            for (0..4) |j| {
+                const sc1: f32 = d * @as(f32, @floatFromInt(sm.scales[j * 2]));
+                const m1: f32 = dmin * @as(f32, @floatFromInt(sm.mins[j * 2]));
+                const sc2: f32 = d * @as(f32, @floatFromInt(sm.scales[j * 2 + 1]));
+                const m2: f32 = dmin * @as(f32, @floatFromInt(sm.mins[j * 2 + 1]));
+
+                const full_nibbles_raw: @Vector(32, u8) = (qs + j * 32)[0..32].*;
+                const low_u8: @Vector(32, u8) = full_nibbles_raw & @as(@Vector(32, u8), @splat(0x0F));
+                const high_u8: @Vector(32, u8) = full_nibbles_raw >> @as(@Vector(32, u8), @splat(4));
+
+                const x_block_0 = x_base + j * 2;
+                const input_lo: @Vector(32, i8) = (x_vals + x_block_0 * 32)[0..32].*;
+                const dot_lo: f32 = @floatFromInt(@reduce(.Add, intDotU8xI8(zero_i32, low_u8, input_lo)));
+                acc[row] += x_scales[x_block_0] * (sc1 * dot_lo - m1 * x_block_sums[x_block_0]);
+
+                const x_block_1 = x_base + j * 2 + 1;
+                const input_hi: @Vector(32, i8) = (x_vals + x_block_1 * 32)[0..32].*;
+                const dot_hi: f32 = @floatFromInt(@reduce(.Add, intDotU8xI8(zero_i32, high_u8, input_hi)));
+                acc[row] += x_scales[x_block_1] * (sc2 * dot_hi - m2 * x_block_sums[x_block_1]);
+            }
+        }
+    }
+
+    return acc;
+}
+
+/// 2-token × 4-row R4 dot product kernel for Q4_K weights.
+inline fn dotQ4_K_q8_R4x2(
+    noalias x_vals_0: [*]const i8,
+    noalias x_scales_0: [*]const f32,
+    noalias x_block_sums_0: [*]const f32,
+    noalias x_vals_1: [*]const i8,
+    noalias x_scales_1: [*]const f32,
+    noalias x_block_sums_1: [*]const f32,
+    noalias group_ptr: [*]const u8,
+    num_super_blocks: usize,
+) [2][4]f32 {
+    @setFloatMode(.optimized);
+    @setEvalBranchQuota(50000);
+    const zero_i32: @Vector(8, i32) = @splat(0);
+
+    var acc0: [4]f32 = .{ 0, 0, 0, 0 };
+    var acc1: [4]f32 = .{ 0, 0, 0, 0 };
+
+    for (0..num_super_blocks) |sb| {
+        const x_base = sb * 8;
+
+        inline for (0..4) |row| {
+            const block_ptr = group_ptr + sb * (4 * Q4K_BLOCK_BYTES) + row * Q4K_BLOCK_BYTES;
+
+            const d: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[0..2], .little))));
+            const dmin: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[2..4], .little))));
+            const sm = unpackScales(block_ptr[4..16]);
+            const qs = block_ptr + Q4K_HEADER_BYTES;
+
+            for (0..4) |j| {
+                const sc1: f32 = d * @as(f32, @floatFromInt(sm.scales[j * 2]));
+                const m1: f32 = dmin * @as(f32, @floatFromInt(sm.mins[j * 2]));
+                const sc2: f32 = d * @as(f32, @floatFromInt(sm.scales[j * 2 + 1]));
+                const m2: f32 = dmin * @as(f32, @floatFromInt(sm.mins[j * 2 + 1]));
+
+                const full_nibbles_raw: @Vector(32, u8) = (qs + j * 32)[0..32].*;
+                const low_u8: @Vector(32, u8) = full_nibbles_raw & @as(@Vector(32, u8), @splat(0x0F));
+                const high_u8: @Vector(32, u8) = full_nibbles_raw >> @as(@Vector(32, u8), @splat(4));
+
+                const x_block_0 = x_base + j * 2;
+                {
+                    const in0: @Vector(32, i8) = (x_vals_0 + x_block_0 * 32)[0..32].*;
+                    const in1: @Vector(32, i8) = (x_vals_1 + x_block_0 * 32)[0..32].*;
+                    const d0: f32 = @floatFromInt(@reduce(.Add, intDotU8xI8(zero_i32, low_u8, in0)));
+                    const d1: f32 = @floatFromInt(@reduce(.Add, intDotU8xI8(zero_i32, low_u8, in1)));
+                    acc0[row] += x_scales_0[x_block_0] * (sc1 * d0 - m1 * x_block_sums_0[x_block_0]);
+                    acc1[row] += x_scales_1[x_block_0] * (sc1 * d1 - m1 * x_block_sums_1[x_block_0]);
+                }
+
+                const x_block_1 = x_base + j * 2 + 1;
+                {
+                    const in0: @Vector(32, i8) = (x_vals_0 + x_block_1 * 32)[0..32].*;
+                    const in1: @Vector(32, i8) = (x_vals_1 + x_block_1 * 32)[0..32].*;
+                    const d0: f32 = @floatFromInt(@reduce(.Add, intDotU8xI8(zero_i32, high_u8, in0)));
+                    const d1: f32 = @floatFromInt(@reduce(.Add, intDotU8xI8(zero_i32, high_u8, in1)));
+                    acc0[row] += x_scales_0[x_block_1] * (sc2 * d0 - m2 * x_block_sums_0[x_block_1]);
+                    acc1[row] += x_scales_1[x_block_1] * (sc2 * d1 - m2 * x_block_sums_1[x_block_1]);
+                }
+            }
+        }
+    }
+
+    return .{ acc0, acc1 };
+}
+
 // ---- Scalar matmul with f32 input (for MOE variant) ----
 
 /// Matmul with Q4_K quantized weights and f32 input, parallelized over output rows.
