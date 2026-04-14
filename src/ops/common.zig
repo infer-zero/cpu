@@ -86,12 +86,14 @@ pub fn ropePartial(
 }
 
 pub fn dot(a: []const f32, b: []const f32) f32 {
-    @setFloatMode(.optimized);
-    var sum: f32 = 0.0;
+    // f64 accumulator: serial f32 sum over head_dim values drifts enough
+    // across many attention scoring calls to flip argmax. Llama.cpp uses
+    // SIMD-parallel f32 (~log(N) error); f64 here matches or exceeds that.
+    var sum: f64 = 0.0;
     for (a, b) |a_val, b_val| {
-        sum += a_val * b_val;
+        sum += @as(f64, a_val) * @as(f64, b_val);
     }
-    return sum;
+    return @floatCast(sum);
 }
 
 pub fn scaledAdd(
@@ -215,8 +217,9 @@ pub fn matmulF32(
 }
 
 inline fn dotF32(noalias a: [*]const f32, noalias b: [*]const f32, len: usize) f32 {
-    @setFloatMode(.optimized);
-    var sum: f32 = 0.0;
-    for (0..len) |i| sum += a[i] * b[i];
-    return sum;
+    // f64 accumulator — used for LM head and MOE router matmuls. See
+    // `dot` above.
+    var sum: f64 = 0.0;
+    for (0..len) |i| sum += @as(f64, a[i]) * @as(f64, b[i]);
+    return @floatCast(sum);
 }
