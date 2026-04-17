@@ -6,23 +6,13 @@ const WaitGroup = std.Thread.WaitGroup;
 // ---- Element-wise operations ----
 
 pub fn rmsNorm(state: []f32, weights: []const f32, epsilon: f32) void {
-    // Accumulate sum-of-squares in f64 to match llama.cpp's `ggml_float`
-    // (typedef'd to double). f32 accumulation drifts enough across many
-    // layers to flip greedy argmax after ~25-30 decode tokens on
-    // Qwen3-0.6B-Q8_0; doubling precision here matches llama.cpp's
-    // logit ordering.
-    var sum_sq: f64 = 0.0;
-    {
-        @setFloatMode(.optimized);
-        for (state) |value| sum_sq += @as(f64, value) * @as(f64, value);
-    }
-    const mean: f64 = sum_sq / @as(f64, @floatFromInt(state.len));
-    const inv_rms: f32 = @floatCast(1.0 / @sqrt(mean + @as(f64, epsilon)));
-    {
-        @setFloatMode(.optimized);
-        for (state, weights) |*state_val, weight_val| {
-            state_val.* = state_val.* * inv_rms * weight_val;
-        }
+    @setFloatMode(.optimized);
+    var sum_sq: f32 = 0.0;
+    for (state) |value| sum_sq += value * value;
+    const mean: f32 = sum_sq / @as(f32, @floatFromInt(state.len));
+    const inv_rms: f32 = 1.0 / @sqrt(mean + epsilon);
+    for (state, weights) |*state_val, weight_val| {
+        state_val.* = state_val.* * inv_rms * weight_val;
     }
 }
 
@@ -39,10 +29,10 @@ pub fn rmsNormPerHead(
     for (0..num_heads) |head| {
         const base = head * head_dim;
         const head_slice = data[base..][0..head_dim];
-        var sum_sq: f64 = 0.0;
-        for (head_slice) |value| sum_sq += @as(f64, value) * @as(f64, value);
-        const mean: f64 = sum_sq / @as(f64, @floatFromInt(head_dim));
-        const inv_rms: f32 = @floatCast(1.0 / @sqrt(mean + @as(f64, epsilon)));
+        var sum_sq: f32 = 0.0;
+        for (head_slice) |value| sum_sq += value * value;
+        const mean: f32 = sum_sq / @as(f32, @floatFromInt(head_dim));
+        const inv_rms: f32 = 1.0 / @sqrt(mean + epsilon);
         for (head_slice, norm_weights[0..head_dim]) |*sv, wv| {
             sv.* = sv.* * inv_rms * wv;
         }
@@ -86,14 +76,12 @@ pub fn ropePartial(
 }
 
 pub fn dot(a: []const f32, b: []const f32) f32 {
-    // f64 accumulator: serial f32 sum over head_dim values drifts enough
-    // across many attention scoring calls to flip argmax. Llama.cpp uses
-    // SIMD-parallel f32 (~log(N) error); f64 here matches or exceeds that.
-    var sum: f64 = 0.0;
+    @setFloatMode(.optimized);
+    var sum: f32 = 0.0;
     for (a, b) |a_val, b_val| {
-        sum += @as(f64, a_val) * @as(f64, b_val);
+        sum += a_val * b_val;
     }
-    return @floatCast(sum);
+    return sum;
 }
 
 pub fn scaledAdd(
@@ -113,10 +101,6 @@ pub fn scaledAdd(
 ///   for (weights, 0..) |w, pos| {
 ///       for (output, 0..) |*o, i| o.* += values[pos * stride + offset + i] * w;
 ///   }
-/// but with the inner sum accumulated in f64 per element — avoids the
-/// f32 drift that builds up across many attended positions in attention
-/// V·weights. Mirrors the `dot`/`rmsNorm`/`softmax` f64 accumulator
-/// pattern used elsewhere in this file.
 pub fn weightedSumF32(
     output: []f32,
     values: []const f32,
@@ -124,13 +108,14 @@ pub fn weightedSumF32(
     offset: usize,
     weights: []const f32,
 ) void {
+    @setFloatMode(.optimized);
     const dim = output.len;
     for (0..dim) |i| {
-        var acc: f64 = 0;
+        var acc: f32 = 0;
         for (weights, 0..) |w, pos| {
-            acc += @as(f64, values[pos * stride + offset + i]) * @as(f64, w);
+            acc += values[pos * stride + offset + i] * w;
         }
-        output[i] = @floatCast(acc);
+        output[i] = acc;
     }
 }
 
@@ -139,17 +124,14 @@ pub fn softmax(scores: []f32) void {
     var max_val: f32 = scores[0];
     for (scores[1..]) |score| max_val = @max(max_val, score);
 
-    // Accumulate in f64 to match llama.cpp's `ggml_float` (double) softmax
-    // sum — matters for long contexts where many small exp() values sum
-    // and f32 rounding flips attention weights enough to drift logits.
-    var sum_exp: f64 = 0.0;
+    var sum_exp: f32 = 0.0;
     for (scores) |*score| {
         score.* = @exp(score.* - max_val);
-        sum_exp += @as(f64, score.*);
+        sum_exp += score.*;
     }
 
     if (sum_exp > 0.0) {
-        const inv: f32 = @floatCast(1.0 / sum_exp);
+        const inv: f32 = 1.0 / sum_exp;
         for (scores) |*score| score.* *= inv;
     }
 }
@@ -244,9 +226,8 @@ pub fn matmulF32(
 }
 
 inline fn dotF32(noalias a: [*]const f32, noalias b: [*]const f32, len: usize) f32 {
-    // f64 accumulator — used for LM head and MOE router matmuls. See
-    // `dot` above.
-    var sum: f64 = 0.0;
-    for (0..len) |i| sum += @as(f64, a[i]) * @as(f64, b[i]);
-    return @floatCast(sum);
+    @setFloatMode(.optimized);
+    var sum: f32 = 0.0;
+    for (0..len) |i| sum += a[i] * b[i];
+    return sum;
 }

@@ -15,15 +15,14 @@ pub fn f32ToBF16(src: []const f32, dst: []u16) void {
 }
 
 pub fn dotF32BF16(a: []const f32, b: []const u16) f32 {
-    // f64 accumulator — used for attention QK scoring against bf16 KV cache.
-    // See common.dot.
-    var sum: f64 = 0.0;
+    @setFloatMode(.optimized);
+    var sum: f32 = 0.0;
     for (a, b) |a_val, b_val| {
         const bits: u32 = @as(u32, b_val) << 16;
         const b_f32: f32 = @bitCast(bits);
-        sum += @as(f64, a_val) * @as(f64, b_f32);
+        sum += a_val * b_f32;
     }
-    return @floatCast(sum);
+    return sum;
 }
 
 pub fn scaledAddBF16(output: []f32, values: []const u16, scale: f32) void {
@@ -205,15 +204,12 @@ fn dispatchFusedFFN(
 // ---- Generic dot product ----
 
 inline fn dotW(comptime W: type, noalias a: [*]const f32, noalias b: [*]const W, len: usize) f32 {
-    // f64 accumulator — inner loop of every BF16 matmul. Costs ~2-3×
-    // prefill speed vs f32 with auto-vectorized FMA, but matches
-    // llama.cpp's effective precision (their SIMD-parallel f32 sum still
-    // accumulates noise; f64 is unambiguously correct).
-    var sum: f64 = 0.0;
+    @setFloatMode(.optimized);
+    var sum: f32 = 0.0;
     for (0..len) |i| {
-        sum += @as(f64, a[i]) * @as(f64, toF32(W, b[i]));
+        sum += a[i] * toF32(W, b[i]);
     }
-    return @floatCast(sum);
+    return sum;
 }
 
 inline fn toF32(comptime W: type, val: W) f32 {

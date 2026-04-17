@@ -632,14 +632,10 @@ inline fn dotQ8_0_q8(
     noalias w_bytes: [*]const u8,
     num_blocks: usize,
 ) f32 {
-    // f64 accumulator (V8d) — per-block i32 dots are exact, but the
-    // scaled sum across `num_blocks` blocks drifts in f32. Promoting to
-    // f64 here matches the precision regime of llama.cpp + ggml after
-    // their parallel-sum SIMD reduction.
-    const V8d = @Vector(8, f64);
+    const V8f = @Vector(8, f32);
     const V32i8 = @Vector(32, i8);
     const zero_i32: @Vector(8, i32) = @splat(0);
-    var acc: V8d = @splat(0);
+    var acc: V8f = @splat(0);
 
     var block: usize = 0;
     if (comptime has_avx512_vnni) {
@@ -667,11 +663,10 @@ inline fn dotQ8_0_q8(
             const dots = intDotI8_512(zero_i32_16, input_64, weight_64);
             const dots_arr: [16]i32 = dots;
 
-            // Split and apply per-block scales (f64 for stable accumulation)
-            const scale0: V8d = @splat(@as(f64, x_scales[block]) * @as(f64, ws0));
-            const scale1: V8d = @splat(@as(f64, x_scales[block + 1]) * @as(f64, ws1));
-            acc += @as(V8d, @floatFromInt(@as(@Vector(8, i32), dots_arr[0..8].*))) * scale0;
-            acc += @as(V8d, @floatFromInt(@as(@Vector(8, i32), dots_arr[8..16].*))) * scale1;
+            const scale0: V8f = @splat(x_scales[block] * ws0);
+            const scale1: V8f = @splat(x_scales[block + 1] * ws1);
+            acc += @as(V8f, @floatFromInt(@as(@Vector(8, i32), dots_arr[0..8].*))) * scale0;
+            acc += @as(V8f, @floatFromInt(@as(@Vector(8, i32), dots_arr[8..16].*))) * scale1;
         }
     } else {
         // 4x block unrolling
@@ -681,12 +676,12 @@ inline fn dotQ8_0_q8(
                 const weight_scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[0..2], .little))));
                 const weight_data: [*]const i8 = @ptrCast(block_ptr + 2);
                 const input_data = x_vals + (block + i) * 32;
-                const combined_scale: V8d = @splat(@as(f64, x_scales[block + i]) * @as(f64, weight_scale));
+                const combined_scale: V8f = @splat(x_scales[block + i] * weight_scale);
 
                 const input_i8: V32i8 = input_data[0..32].*;
                 const weight_i8: V32i8 = weight_data[0..32].*;
 
-                acc += @as(V8d, @floatFromInt(intDotI8(zero_i32, input_i8, weight_i8))) * combined_scale;
+                acc += @as(V8f, @floatFromInt(intDotI8(zero_i32, input_i8, weight_i8))) * combined_scale;
             }
         }
         // 2x step-down
@@ -696,12 +691,12 @@ inline fn dotQ8_0_q8(
                 const weight_scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[0..2], .little))));
                 const weight_data: [*]const i8 = @ptrCast(block_ptr + 2);
                 const input_data = x_vals + (block + i) * 32;
-                const combined_scale: V8d = @splat(@as(f64, x_scales[block + i]) * @as(f64, weight_scale));
+                const combined_scale: V8f = @splat(x_scales[block + i] * weight_scale);
 
                 const input_i8: V32i8 = input_data[0..32].*;
                 const weight_i8: V32i8 = weight_data[0..32].*;
 
-                acc += @as(V8d, @floatFromInt(intDotI8(zero_i32, input_i8, weight_i8))) * combined_scale;
+                acc += @as(V8f, @floatFromInt(intDotI8(zero_i32, input_i8, weight_i8))) * combined_scale;
             }
         }
     }
@@ -711,15 +706,15 @@ inline fn dotQ8_0_q8(
         const weight_scale: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[0..2], .little))));
         const weight_data: [*]const i8 = @ptrCast(block_ptr + 2);
         const input_data = x_vals + block * 32;
-        const combined_scale: V8d = @splat(@as(f64, x_scales[block]) * @as(f64, weight_scale));
+        const combined_scale: V8f = @splat(x_scales[block] * weight_scale);
 
         const input_i8: V32i8 = input_data[0..32].*;
         const weight_i8: V32i8 = weight_data[0..32].*;
 
-        acc += @as(V8d, @floatFromInt(intDotI8(zero_i32, input_i8, weight_i8))) * combined_scale;
+        acc += @as(V8f, @floatFromInt(intDotI8(zero_i32, input_i8, weight_i8))) * combined_scale;
     }
 
-    return @floatCast(@reduce(.Add, acc));
+    return @reduce(.Add, acc);
 }
 
 /// 4-row dot product kernel for R4-interleaved Q8_0 weights.
