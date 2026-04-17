@@ -9,6 +9,24 @@ const WaitGroup = std.Thread.WaitGroup;
 /// 16 groups = 64 output rows.
 const tile_groups: usize = 16;
 
+/// X4 layout per row, per group of 4 consecutive blocks (modeled after
+/// llama.cpp's `block_q8_0_x4`):
+///
+///   [4 × f16 scales (8B)] [4 × 32B quantized data]   = 136 bytes
+///
+/// For an input row of `num_blocks` Q8_0 blocks (assume 4-divisible),
+/// the row stores `num_blocks/4` such groups back-to-back, total
+/// `num_blocks * 34` bytes — same size as the original row-major
+/// layout, just reorganized so a 4-block iteration can:
+///   • load all 4 weight scales with one vmovq + vcvtph2ps
+///   • do 4 vpdpbusd
+///   • pack all 4 partial sums into one V8i with the standard ggml
+///     unpack-add chain
+///   • multiply by 4 packed scales in a single FMA
+const x4_block_bytes: usize = 4 * 2 + 4 * 32; // 136
+const x4_data_offset: usize = 4 * 2; // 8: scales come first
+const x4_row_data_bytes: usize = 32;
+
 /// True when targeting a CPU with 512-bit VNNI (AVX-512 VNNI).
 /// Zen 4/5, Intel Sapphire Rapids+. Build with -Dcpu=native or -Dcpu=znver4.
 const has_avx512_vnni = builtin.cpu.arch == .x86_64 and
@@ -617,6 +635,296 @@ fn matmulSiluHadamardQ8R4(
         effective_tile,
         num_groups,
     );
+}
+
+// ---- X4 layout: repack + matmul + dot ----
+
+/// Repack a row-major Q8_0 weight buffer into the X4 layout. Each row
+/// becomes `num_blocks/4` groups of [4 f16 scales | 4 × 32B data]; total
+/// size unchanged. Pads the trailing rows with zeros if `out_dim` is not
+/// a multiple of 4. `num_blocks` (= in_dim / 32) must be a multiple of
+/// 4 — every CPU Q8_0 model variant we care about has dim divisible by
+/// 128, so this is always true in practice. Frees `raw`.
+pub fn repackQ8X4(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) ![]u8 {
+    const src_block_size = 34; // 2B f16 scale + 32B i8 quants
+    const num_blocks = in_dim / 32;
+    std.debug.assert(num_blocks % 4 == 0);
+    const num_groups = num_blocks / 4;
+    const src_row_bytes = num_blocks * src_block_size;
+    const dst_row_bytes = num_groups * x4_block_bytes; // == src_row_bytes
+    const padded_out_dim = (out_dim + 3) / 4 * 4;
+
+    const result = try allocator.alloc(u8, padded_out_dim * dst_row_bytes);
+    @memset(result, 0);
+
+    for (0..out_dim) |row| {
+        const dst_row = result[row * dst_row_bytes ..][0..dst_row_bytes];
+        for (0..num_groups) |group| {
+            const dst_group = dst_row[group * x4_block_bytes ..][0..x4_block_bytes];
+            // Pull 4 source blocks for this group of 4 consecutive blocks.
+            inline for (0..4) |i| {
+                const src_block = raw[row * src_row_bytes + (group * 4 + i) * src_block_size ..][0..src_block_size];
+                @memcpy(dst_group[i * 2 ..][0..2], src_block[0..2]);
+                @memcpy(dst_group[x4_data_offset + i * x4_row_data_bytes ..][0..x4_row_data_bytes], src_block[2..34]);
+            }
+        }
+    }
+
+    allocator.free(@constCast(raw));
+    return result;
+}
+
+/// Matmul against X4-layout Q8_0 weights with f32 input. Quantizes input,
+/// then dispatches the integer dot product. q_vals/q_scales are caller-
+/// owned scratch buffers.
+pub fn matmulX4(
+    pool: ?*Pool,
+    input: []const f32,
+    w_bytes: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+    q_vals: []i8,
+    q_scales: []f32,
+) void {
+    const num_blocks = in_dim / 32;
+    for (0..batch_size) |token| {
+        quantizeF32ToQ8(
+            input[token * in_dim ..][0..in_dim],
+            q_vals[token * in_dim ..][0..in_dim],
+            q_scales[token * num_blocks ..][0..num_blocks],
+        );
+    }
+    matmulQ8X4(pool, q_vals, q_scales, w_bytes, output, in_dim, out_dim, batch_size);
+}
+
+/// Matmul against X4-layout Q8_0 weights with pre-quantized i8 input,
+/// parallelized over output rows.
+pub fn matmulQ8X4(
+    pool: ?*Pool,
+    q_vals: []const i8,
+    q_scales: []const f32,
+    w_bytes: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+) void {
+    const num_blocks = in_dim / 32;
+    const row_bytes = (num_blocks / 4) * x4_block_bytes;
+
+    const Kernel = struct {
+        fn run(
+            quantized_vals: []const i8,
+            quantized_scales: []const f32,
+            out: []f32,
+            weights: []const u8,
+            input_dim: usize,
+            output_dim: usize,
+            batch: usize,
+            blocks: usize,
+            stride: usize,
+            start_row: usize,
+            end_row: usize,
+        ) void {
+            for (start_row..end_row) |row| {
+                const weight_row = weights.ptr + row * stride;
+                for (0..batch) |token| {
+                    out[token * output_dim + row] = dotQ8_0_q8_x4(
+                        quantized_vals[token * input_dim ..].ptr,
+                        quantized_scales[token * blocks ..].ptr,
+                        weight_row,
+                        blocks,
+                    );
+                }
+            }
+        }
+    };
+
+    if (pool) |p| {
+        if (out_dim >= 32) {
+            const num_threads = p.threads.len + 1;
+            const base = out_dim / num_threads;
+            const extra = out_dim % num_threads;
+            var wg: WaitGroup = .{};
+            var start: usize = 0;
+            for (0..num_threads) |thread_index| {
+                const count = base + @intFromBool(thread_index < extra);
+                p.spawnWg(&wg, Kernel.run, .{
+                    q_vals,    q_scales,  output,    w_bytes,
+                    in_dim,    out_dim,   batch_size, num_blocks,
+                    row_bytes, start,     start + count,
+                });
+                start += count;
+            }
+            p.waitAndWork(&wg);
+            return;
+        }
+    }
+    Kernel.run(q_vals, q_scales, output, w_bytes, in_dim, out_dim, batch_size, num_blocks, row_bytes, 0, out_dim);
+}
+
+/// Fused gate+up+SiLU·hadamard against X4-layout weights. Quantizes
+/// input then dispatches the fused integer kernel.
+pub fn matmulSiluHadamardX4(
+    pool: ?*Pool,
+    input: []const f32,
+    gate_weights: []const u8,
+    up_weights: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+    q_vals: []i8,
+    q_scales: []f32,
+) void {
+    const num_blocks = in_dim / 32;
+    for (0..batch_size) |token| {
+        quantizeF32ToQ8(
+            input[token * in_dim ..][0..in_dim],
+            q_vals[token * in_dim ..][0..in_dim],
+            q_scales[token * num_blocks ..][0..num_blocks],
+        );
+    }
+    matmulSiluHadamardQ8X4(pool, q_vals, q_scales, gate_weights, up_weights, output, in_dim, out_dim, batch_size);
+}
+
+fn matmulSiluHadamardQ8X4(
+    pool: ?*Pool,
+    q_vals: []const i8,
+    q_scales: []const f32,
+    gate_weights: []const u8,
+    up_weights: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+) void {
+    const num_blocks = in_dim / 32;
+    const row_bytes = (num_blocks / 4) * x4_block_bytes;
+
+    const Kernel = struct {
+        fn run(
+            quantized_vals: []const i8,
+            quantized_scales: []const f32,
+            out: []f32,
+            gate_w: []const u8,
+            up_w: []const u8,
+            input_dim: usize,
+            output_dim: usize,
+            batch: usize,
+            blocks: usize,
+            stride: usize,
+            start_row: usize,
+            end_row: usize,
+        ) void {
+            @setFloatMode(.optimized);
+            for (start_row..end_row) |row| {
+                const gate_row = gate_w.ptr + row * stride;
+                const up_row = up_w.ptr + row * stride;
+                for (0..batch) |token| {
+                    const input_vals = quantized_vals[token * input_dim ..].ptr;
+                    const input_scales = quantized_scales[token * blocks ..].ptr;
+                    const gate = dotQ8_0_q8_x4(input_vals, input_scales, gate_row, blocks);
+                    const up = dotQ8_0_q8_x4(input_vals, input_scales, up_row, blocks);
+                    out[token * output_dim + row] = common.silu(gate) * up;
+                }
+            }
+        }
+    };
+
+    if (pool) |p| {
+        if (out_dim >= 32) {
+            const num_threads = p.threads.len + 1;
+            const base = out_dim / num_threads;
+            const extra = out_dim % num_threads;
+            var wg: WaitGroup = .{};
+            var start: usize = 0;
+            for (0..num_threads) |thread_index| {
+                const count = base + @intFromBool(thread_index < extra);
+                p.spawnWg(&wg, Kernel.run, .{
+                    q_vals,    q_scales,  output,    gate_weights, up_weights,
+                    in_dim,    out_dim,   batch_size, num_blocks,   row_bytes,
+                    start,     start + count,
+                });
+                start += count;
+            }
+            p.waitAndWork(&wg);
+            return;
+        }
+    }
+    Kernel.run(q_vals, q_scales, output, gate_weights, up_weights, in_dim, out_dim, batch_size, num_blocks, row_bytes, 0, out_dim);
+}
+
+/// Single-row dot kernel for X4-layout Q8_0 weights. Processes 4
+/// consecutive blocks per iteration, packing the four partial sums
+/// from 4 vpdpbusd into one V8i so the per-block scale FMA collapses
+/// into a single vfmadd231ps. Modeled after llama.cpp's
+/// `mul_mat_qX_q8_Helper` Q8_0 path.
+inline fn dotQ8_0_q8_x4(
+    noalias x_vals: [*]const i8,
+    noalias x_scales: [*]const f32,
+    noalias w_row: [*]const u8,
+    num_blocks: usize,
+) f32 {
+    @setFloatMode(.optimized);
+    const V8f = @Vector(8, f32);
+    const V8i = @Vector(8, i32);
+    const V32i8 = @Vector(32, i8);
+    const zero_i32: V8i = @splat(0);
+
+    var acc: V8f = @splat(0);
+    var block: usize = 0;
+    while (block + 3 < num_blocks) : (block += 4) {
+        const group_ptr = w_row + (block / 4) * x4_block_bytes;
+
+        // Load 4 packed f16 scales (8 bytes) → 4 f32.
+        const ws_packed: u64 = std.mem.readInt(u64, group_ptr[0..8], .little);
+        const ws_h: @Vector(4, f16) = @bitCast(ws_packed);
+        const ws_f: @Vector(4, f32) = @floatCast(ws_h);
+
+        // Load 4 input scales as a vector.
+        const is_f: @Vector(4, f32) = (x_scales + block)[0..4].*;
+        const combined: @Vector(4, f32) = ws_f * is_f;
+
+        // Replicate to 8 lanes: packDotsX4 below produces
+        // [b0_lo, b1_lo, b2_lo, b3_lo, b0_hi, b1_hi, b2_hi, b3_hi];
+        // each scale needs to multiply both halves of its block.
+        const combined_v8: V8f = @shuffle(f32, combined, undefined, @Vector(8, i32){ 0, 1, 2, 3, 0, 1, 2, 3 });
+
+        // 4 dot products, one per block.
+        var p: [4]V8i = undefined;
+        inline for (0..4) |i| {
+            const x_block: V32i8 = (x_vals + (block + i) * 32)[0..32].*;
+            const w_block_ptr: [*]const i8 = @ptrCast(group_ptr + x4_data_offset + i * x4_row_data_bytes);
+            const w_block: V32i8 = w_block_ptr[0..32].*;
+            p[i] = intDotI8(zero_i32, x_block, w_block);
+        }
+
+        const packed_dots = packDotsX4(p[0], p[1], p[2], p[3]);
+        acc += @as(V8f, @floatFromInt(packed_dots)) * combined_v8;
+    }
+    return @reduce(.Add, acc);
+}
+
+/// Pack four V8i partial sums (each from one block's vpdpbusd) into one
+/// V8i with `[b0_lo, b1_lo, b2_lo, b3_lo, b0_hi, b1_hi, b2_hi, b3_hi]`,
+/// where `bX_lo` sums `pX[0..3]` (the lower 128-bit lane) and `bX_hi`
+/// sums `pX[4..7]` (the upper lane).
+///
+/// Implements the AVX2 `unpacklo32 / unpackhi32 → add` two-stage chain
+/// used by ggml's Sum4 helper. Cheaper than four hsums because it stays
+/// vectorized end-to-end and feeds straight into vcvtdq2ps + vfmadd.
+inline fn packDotsX4(p0: @Vector(8, i32), p1: @Vector(8, i32), p2: @Vector(8, i32), p3: @Vector(8, i32)) @Vector(8, i32) {
+    const lo32: @Vector(8, i32) = @Vector(8, i32){ 0, -1, 1, -2, 4, -5, 5, -6 };
+    const hi32: @Vector(8, i32) = @Vector(8, i32){ 2, -3, 3, -4, 6, -7, 7, -8 };
+    const lo64: @Vector(8, i32) = @Vector(8, i32){ 0, 1, -1, -2, 4, 5, -5, -6 };
+    const hi64: @Vector(8, i32) = @Vector(8, i32){ 2, 3, -3, -4, 6, 7, -7, -8 };
+
+    const p01 = @shuffle(i32, p0, p1, lo32) + @shuffle(i32, p0, p1, hi32);
+    const p23 = @shuffle(i32, p2, p3, lo32) + @shuffle(i32, p2, p3, hi32);
+    return @shuffle(i32, p01, p23, lo64) + @shuffle(i32, p01, p23, hi64);
 }
 
 // ---- Dot product kernels ----
