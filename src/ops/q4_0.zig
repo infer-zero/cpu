@@ -1546,7 +1546,22 @@ inline fn intDotI8(
         }
     }
 
-    // x86 / fallback: apply sign trick, then use vpdpbusd.
+    if (comptime builtin.cpu.arch == .x86_64) {
+        // vpsignb(a,a) = |a| and vpsignb(b,a) = sign(a) * b; cheaper
+        // than @abs + @select + negate.
+        const abs_a = asm ("vpsignb %[a], %[a], %[out]"
+            : [out] "=x" (-> @Vector(32, u8)),
+            : [a] "x" (a),
+        );
+        const signed_b = asm ("vpsignb %[a], %[b], %[out]"
+            : [out] "=x" (-> @Vector(32, u8)),
+            : [a] "x" (a),
+              [b] "x" (b),
+        );
+        return vpdpbusd(acc, abs_a, signed_b);
+    }
+
+    // Fallback sign trick.
     const zero: @Vector(32, i8) = @splat(0);
     const abs_a = @abs(a);
     const a_negative = a < zero;
