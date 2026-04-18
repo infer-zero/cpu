@@ -3,12 +3,18 @@ const builtin = @import("builtin");
 
 /// Initialize a thread pool with P-core detection on Linux.
 /// Returns null if the pool cannot be created or if only one core is available.
+///
+/// Honors INFER_THREADS env var: when set to a positive integer, caps the
+/// worker count at (value - 1) to match `-t <value>` semantics in llama-bench
+/// (main thread + N-1 workers). Useful for scaling experiments. Set to 1
+/// to disable the pool entirely.
 pub fn initPool(allocator: std.mem.Allocator) ?*std.Thread.Pool {
-    const n_workers = if (comptime builtin.os.tag == .linux)
+    const detected = if (comptime builtin.os.tag == .linux)
         detectAndPinPhysicalCores() orelse fallbackWorkerCount()
     else
         fallbackWorkerCount();
 
+    const n_workers = envThreadOverride() orelse detected;
     if (n_workers == 0) return null;
 
     const pool = allocator.create(std.Thread.Pool) catch return null;
@@ -17,6 +23,15 @@ pub fn initPool(allocator: std.mem.Allocator) ?*std.Thread.Pool {
         return null;
     };
     return pool;
+}
+
+fn envThreadOverride() ?usize {
+    const heap = std.heap.page_allocator;
+    const raw = std.process.getEnvVarOwned(heap, "INFER_THREADS") catch return null;
+    defer heap.free(raw);
+    const total = std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\n\r"), 10) catch return null;
+    if (total == 0) return null;
+    return total - 1;
 }
 
 fn fallbackWorkerCount() usize {
