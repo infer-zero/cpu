@@ -16,13 +16,6 @@ const Q4K_DATA_BYTES: usize = 128; // qs
 const has_avx512_vnni = builtin.cpu.arch == .x86_64 and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vnni);
 
-/// Max Q4_K blocks per row for dequant scratch buffers (covers up to dim=32768).
-const max_num_super_blocks: usize = 128; // 128 * 256 = 32768 elements
-/// Max Q8 blocks per row (= max_num_super_blocks * 8).
-const max_num_q8_blocks: usize = max_num_super_blocks * 8;
-/// Max tokens for gate accumulator in fused SiLU kernels.
-const max_batch_size: usize = 4096;
-
 // ---- Quantization (re-exports from q4_0) ----
 
 pub const quantizeF32ToQ8 = @import("q4_0.zig").quantizeF32ToQ8;
@@ -232,8 +225,12 @@ pub fn matmulQ8(
     const row_bytes = num_super_blocks * Q4K_BLOCK_BYTES;
     const num_tiles = out_dim;
 
-    // Precompute Q8 block sums for all tokens (input-dependent, weight-independent).
-    var block_sums_buf: [max_batch_size * max_num_q8_blocks]f32 = undefined;
+    // Heap-allocate (not stack) — worst case at batch=4096, dim=32768 is
+    // 16 MB, which overflows the default 8 MB thread stack. Sizing to
+    // actual need (batch_size * num_q8_blocks) keeps typical decode calls
+    // in a single page.
+    const block_sums_buf = std.heap.page_allocator.alloc(f32, batch_size * num_q8_blocks) catch @panic("OOM allocating block_sums_buf");
+    defer std.heap.page_allocator.free(block_sums_buf);
     for (0..batch_size) |token| {
         precomputeQ8BlockSums(
             q_vals[token * num_q8_blocks * 32 ..].ptr,
@@ -241,7 +238,7 @@ pub fn matmulQ8(
             block_sums_buf[token * num_q8_blocks ..].ptr,
         );
     }
-    const block_sums: []const f32 = block_sums_buf[0 .. batch_size * num_q8_blocks];
+    const block_sums: []const f32 = block_sums_buf;
 
     const Kernel = struct {
         fn run(
@@ -362,8 +359,9 @@ pub fn matmulSiluHadamardQ8(
     const row_bytes = num_super_blocks * Q4K_BLOCK_BYTES;
     const num_tiles = out_dim;
 
-    // Precompute Q8 block sums for all tokens.
-    var block_sums_buf: [max_batch_size * max_num_q8_blocks]f32 = undefined;
+    // Heap-allocate (not stack) — see matmulQ8 for rationale.
+    const block_sums_buf = std.heap.page_allocator.alloc(f32, batch_size * num_q8_blocks) catch @panic("OOM allocating block_sums_buf");
+    defer std.heap.page_allocator.free(block_sums_buf);
     for (0..batch_size) |token| {
         precomputeQ8BlockSums(
             q_vals[token * num_q8_blocks * 32 ..].ptr,
@@ -371,7 +369,7 @@ pub fn matmulSiluHadamardQ8(
             block_sums_buf[token * num_q8_blocks ..].ptr,
         );
     }
-    const block_sums: []const f32 = block_sums_buf[0 .. batch_size * num_q8_blocks];
+    const block_sums: []const f32 = block_sums_buf;
 
     const Kernel = struct {
         fn run(
@@ -521,8 +519,9 @@ pub fn matmulQ8R4(
     const num_groups = (out_dim + 3) / 4;
     const num_tiles = num_groups;
 
-    // Precompute Q8 block sums for all tokens.
-    var block_sums_buf: [max_batch_size * max_num_q8_blocks]f32 = undefined;
+    // Heap-allocate (not stack) — see matmulQ8 for rationale.
+    const block_sums_buf = std.heap.page_allocator.alloc(f32, batch_size * num_q8_blocks) catch @panic("OOM allocating block_sums_buf");
+    defer std.heap.page_allocator.free(block_sums_buf);
     for (0..batch_size) |token| {
         precomputeQ8BlockSums(
             q_vals[token * num_q8_blocks * 32 ..].ptr,
@@ -530,7 +529,7 @@ pub fn matmulQ8R4(
             block_sums_buf[token * num_q8_blocks ..].ptr,
         );
     }
-    const block_sums: []const f32 = block_sums_buf[0 .. batch_size * num_q8_blocks];
+    const block_sums: []const f32 = block_sums_buf;
 
     const Kernel = struct {
         fn run(
@@ -661,8 +660,9 @@ pub fn matmulSiluHadamardQ8R4(
     const num_groups = (out_dim + 3) / 4;
     const num_tiles = num_groups;
 
-    // Precompute Q8 block sums for all tokens.
-    var block_sums_buf: [max_batch_size * max_num_q8_blocks]f32 = undefined;
+    // Heap-allocate (not stack) — see matmulQ8 for rationale.
+    const block_sums_buf = std.heap.page_allocator.alloc(f32, batch_size * num_q8_blocks) catch @panic("OOM allocating block_sums_buf");
+    defer std.heap.page_allocator.free(block_sums_buf);
     for (0..batch_size) |token| {
         precomputeQ8BlockSums(
             q_vals[token * num_q8_blocks * 32 ..].ptr,
@@ -670,7 +670,7 @@ pub fn matmulSiluHadamardQ8R4(
             block_sums_buf[token * num_q8_blocks ..].ptr,
         );
     }
-    const block_sums: []const f32 = block_sums_buf[0 .. batch_size * num_q8_blocks];
+    const block_sums: []const f32 = block_sums_buf;
 
     const Kernel = struct {
         fn run(
