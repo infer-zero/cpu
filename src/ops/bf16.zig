@@ -1,10 +1,11 @@
 const std = @import("std");
 const common = @import("common.zig");
+const thread_pool = @import("../thread_pool.zig");
 
 pub const DataType = enum { FP32, FP16, BF16 };
 
-const Pool = std.Thread.Pool;
-const WaitGroup = std.Thread.WaitGroup;
+const Pool = thread_pool.Pool;
+const WaitGroup = thread_pool.WaitGroup;
 
 // ---- BF16-specific element-wise operations ----
 

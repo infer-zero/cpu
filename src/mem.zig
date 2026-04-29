@@ -7,6 +7,14 @@ pub const Info = struct {
     fit: bool,
 };
 
+/// Lazily resolve a default `Io` for the simple, blocking probes below.
+/// `mem.zig` is invoked from leaf code that does not currently have access
+/// to the upstream `Io`, so we fall back to the stdlib's global single-
+/// threaded instance — adequate for one-off file-stat operations.
+fn defaultIo() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 pub fn checkModelFitsInMemory(path: []const u8) ?Info {
     const model_bytes = estimateModelSize(path) orelse return null;
     const available_bytes = getAvailableMemory() orelse return null;
@@ -24,27 +32,30 @@ pub fn checkModelFitsInMemory(path: []const u8) ?Info {
 }
 
 pub fn estimateModelSize(path: []const u8) ?u64 {
+    const io = defaultIo();
+    const cwd = std.Io.Dir.cwd();
+
     // Try as single file (GGUF)
-    if (std.fs.cwd().openFile(path, .{})) |file| {
-        defer file.close();
-        const stat = file.stat() catch return null;
+    if (cwd.openFile(io, path, .{})) |file| {
+        defer file.close(io);
+        const stat = file.stat(io) catch return null;
         if (stat.kind == .file) {
             return if (stat.size > 0) stat.size else null;
         }
     } else |_| {}
 
     // Try as directory (HuggingFace with .safetensors files)
-    var dir = std.fs.cwd().openDir(path, .{ .iterate = true }) catch return null;
-    defer dir.close();
+    var dir = cwd.openDir(io, path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
 
     var total: u64 = 0;
     var iter = dir.iterate();
-    while (iter.next() catch return null) |entry| {
+    while (iter.next(io) catch return null) |entry| {
         if (entry.kind != .file) continue;
         if (std.mem.endsWith(u8, entry.name, ".safetensors")) {
-            const file = dir.openFile(entry.name, .{}) catch continue;
-            defer file.close();
-            const stat = file.stat() catch continue;
+            const file = dir.openFile(io, entry.name, .{}) catch continue;
+            defer file.close(io);
+            const stat = file.stat(io) catch continue;
             total += stat.size;
         }
     }
@@ -56,15 +67,16 @@ pub fn getAvailableMemory() ?u64 {
     const builtin = @import("builtin");
     if (builtin.os.tag != .linux) return null;
 
-    const file = std.fs.openFileAbsolute("/proc/meminfo", .{}) catch return null;
-    defer file.close();
+    const io = defaultIo();
+    const file = std.Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{}) catch return null;
+    defer file.close(io);
 
     var buf: [4096]u8 = undefined;
-    const len = file.read(&buf) catch return null;
+    const len = file.readPositional(io, &.{&buf}, 0) catch return null;
     const content = buf[0..len];
 
     const needle = "MemAvailable:";
-    const start = std.mem.indexOf(u8, content, needle) orelse return null;
+    const start = std.mem.find(u8, content, needle) orelse return null;
     const rest = content[start + needle.len ..];
 
     // Skip whitespace
@@ -80,7 +92,7 @@ pub fn getAvailableMemory() ?u64 {
 }
 
 test "estimateModelSize returns null for nonexistent path" {
-    const result = estimateModelSize("/tmp/nonexistent_model_path_that_does_not_exist");
+    const result = estimateModelSize("./nonexistent_model_path_that_does_not_exist");
     try std.testing.expectEqual(null, result);
 }
 

@@ -1,9 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
+const thread_pool = @import("../thread_pool.zig");
 
-const Pool = std.Thread.Pool;
-const WaitGroup = std.Thread.WaitGroup;
+const Pool = thread_pool.Pool;
+const WaitGroup = thread_pool.WaitGroup;
 
 /// Q4_K super-block: 256 elements in 144 bytes.
 /// Layout: d[2](f16) + dmin[2](f16) + scales[12](6-bit packed) + qs[128](nibbles).

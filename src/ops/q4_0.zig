@@ -1,9 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
+const thread_pool = @import("../thread_pool.zig");
 
-const Pool = std.Thread.Pool;
-const WaitGroup = std.Thread.WaitGroup;
+const Pool = thread_pool.Pool;
+const WaitGroup = thread_pool.WaitGroup;
 
 /// Number of R4 groups per output tile for batch matmul.
 /// 16 groups = 64 output rows.
@@ -47,7 +48,7 @@ pub fn quantizeF32ToQ8(
         const inv_scale = 127.0 / max_abs;
         q_scales[block] = max_abs / 127.0;
         for (src, dest) |value, *quantized| {
-            quantized.* = @intFromFloat(@round(value * inv_scale));
+            quantized.* = @round(value * inv_scale);
         }
     }
 }

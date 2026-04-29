@@ -1,37 +1,252 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Initialize a thread pool with P-core detection on Linux.
-/// Returns null if the pool cannot be created or if only one core is available.
+/// Thread pool used by the CPU matmul kernels. Faithfully ports
+/// `std.Thread.Pool` from Zig 0.15.2 onto the 0.16 sync primitives.
 ///
-/// Honors INFER_THREADS env var: when set to a positive integer, caps the
-/// worker count at (value - 1) to match `-t <value>` semantics in llama-bench
-/// (main thread + N-1 workers). Useful for scaling experiments. Set to 1
-/// to disable the pool entirely.
-pub fn initPool(allocator: std.mem.Allocator) ?*std.Thread.Pool {
+/// In 0.16 `std.Thread.Pool` was removed and `std.Thread.Mutex`/`Condition`/
+/// `ResetEvent` moved under `std.Io`, requiring an `Io` argument. Because
+/// `infer_cpu` is a leaf package that does not currently receive an `Io`
+/// from upstream, we use `std.Io.Threaded.global_single_threaded` for the
+/// internal sync primitives — the underlying `futexWait`/`futexWake` are
+/// raw OS syscalls and work correctly across threads regardless of the
+/// Io's task-scheduling mode (the "single-threaded" namespace refers to
+/// async tasks, not to kernel mutexes).
+///
+/// Public surface mirrors the 0.15.2 Pool/WaitGroup we depended on:
+///   * `Pool.threads.len`            — number of background workers
+///   * `Pool.spawnWg(wg, fn, args)`  — enqueue a task, bumping the wg
+///   * `Pool.waitAndWork(wg)`        — drain the queue from the main
+///                                     thread, then block until workers
+///                                     finish remaining tasks
+///   * `WaitGroup.start/finish/wait/reset/isDone`
+const sync_io = std.Io.Threaded.global_single_threaded.io();
+
+const is_waiting: usize = 1 << 0;
+const one_pending: usize = 1 << 1;
+
+pub const WaitGroup = struct {
+    state: std.atomic.Value(usize) = .init(0),
+    event: std.Io.Event = .unset,
+
+    pub fn start(self: *WaitGroup) void {
+        const state = self.state.fetchAdd(one_pending, .monotonic);
+        std.debug.assert((state / one_pending) < (std.math.maxInt(usize) / one_pending));
+    }
+
+    pub fn finish(self: *WaitGroup) void {
+        const state = self.state.fetchSub(one_pending, .acq_rel);
+        std.debug.assert((state / one_pending) > 0);
+
+        if (state == (one_pending | is_waiting)) {
+            self.event.set(sync_io);
+        }
+    }
+
+    pub fn wait(self: *WaitGroup) void {
+        const state = self.state.fetchAdd(is_waiting, .acquire);
+        std.debug.assert(state & is_waiting == 0);
+
+        if ((state / one_pending) > 0) {
+            self.event.waitUncancelable(sync_io);
+        }
+    }
+
+    pub fn reset(self: *WaitGroup) void {
+        self.state.store(0, .monotonic);
+        self.event.reset();
+    }
+
+    pub fn isDone(self: *WaitGroup) bool {
+        const state = self.state.load(.acquire);
+        // Note: 0.15.2 asserts `state & is_waiting == 0` here, but we want
+        // `isDone` to be safe to poll from `waitAndWork` while the main
+        // thread is also working tasks. Drop the assert; the value remains
+        // correct because pending counter is independent of the wait bit.
+        return (state / one_pending) == 0;
+    }
+};
+
+const Runnable = struct {
+    runFn: RunProto,
+    node: std.SinglyLinkedList.Node = .{},
+};
+
+const RunProto = *const fn (*Runnable) void;
+
+pub const Pool = struct {
+    mutex: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    run_queue: std.SinglyLinkedList = .{},
+    is_running: bool = true,
+    allocator: std.mem.Allocator,
+    threads: []std.Thread,
+
+    pub const Options = struct {
+        allocator: std.mem.Allocator,
+        n_jobs: usize,
+        stack_size: usize = std.Thread.SpawnConfig.default_stack_size,
+    };
+
+    pub fn init(pool: *Pool, options: Options) !void {
+        pool.* = .{
+            .allocator = options.allocator,
+            .threads = &.{},
+        };
+        if (builtin.single_threaded or options.n_jobs == 0) return;
+
+        pool.threads = try options.allocator.alloc(std.Thread, options.n_jobs);
+        var spawned: usize = 0;
+        errdefer pool.join(spawned);
+
+        for (pool.threads) |*thread| {
+            thread.* = try std.Thread.spawn(.{
+                .stack_size = options.stack_size,
+                .allocator = options.allocator,
+            }, worker, .{pool});
+            spawned += 1;
+        }
+    }
+
+    pub fn deinit(pool: *Pool) void {
+        pool.join(pool.threads.len);
+        pool.* = undefined;
+    }
+
+    fn join(pool: *Pool, spawned: usize) void {
+        if (builtin.single_threaded or pool.threads.len == 0) {
+            if (pool.threads.len != 0) pool.allocator.free(pool.threads);
+            return;
+        }
+
+        {
+            pool.mutex.lockUncancelable(sync_io);
+            defer pool.mutex.unlock(sync_io);
+            pool.is_running = false;
+        }
+
+        pool.cond.broadcast(sync_io);
+        for (pool.threads[0..spawned]) |thread| thread.join();
+        pool.allocator.free(pool.threads);
+    }
+
+    /// Queue `func(args...)` and arrange for `wait_group.finish()` to be
+    /// called after it returns. Falls back to running inline if allocation
+    /// fails or the build is single-threaded.
+    pub fn spawnWg(pool: *Pool, wait_group: *WaitGroup, comptime func: anytype, args: anytype) void {
+        wait_group.start();
+
+        if (builtin.single_threaded or pool.threads.len == 0) {
+            @call(.auto, func, args);
+            wait_group.finish();
+            return;
+        }
+
+        const Args = @TypeOf(args);
+        const Closure = struct {
+            arguments: Args,
+            pool: *Pool,
+            runnable: Runnable = .{ .runFn = runFn },
+            wait_group: *WaitGroup,
+
+            fn runFn(runnable: *Runnable) void {
+                const closure: *@This() = @alignCast(@fieldParentPtr("runnable", runnable));
+                @call(.auto, func, closure.arguments);
+                closure.wait_group.finish();
+
+                // The thread pool's allocator is protected by the mutex.
+                const mutex = &closure.pool.mutex;
+                mutex.lockUncancelable(sync_io);
+                defer mutex.unlock(sync_io);
+                closure.pool.allocator.destroy(closure);
+            }
+        };
+
+        {
+            pool.mutex.lockUncancelable(sync_io);
+
+            const closure = pool.allocator.create(Closure) catch {
+                pool.mutex.unlock(sync_io);
+                @call(.auto, func, args);
+                wait_group.finish();
+                return;
+            };
+            closure.* = .{
+                .arguments = args,
+                .pool = pool,
+                .wait_group = wait_group,
+            };
+
+            pool.run_queue.prepend(&closure.runnable.node);
+            pool.mutex.unlock(sync_io);
+        }
+
+        // Notify outside the lock to keep the critical section small.
+        pool.cond.signal(sync_io);
+    }
+
+    fn worker(pool: *Pool) void {
+        pool.mutex.lockUncancelable(sync_io);
+        defer pool.mutex.unlock(sync_io);
+
+        while (true) {
+            while (pool.run_queue.popFirst()) |run_node| {
+                pool.mutex.unlock(sync_io);
+                defer pool.mutex.lockUncancelable(sync_io);
+
+                const runnable: *Runnable = @fieldParentPtr("node", run_node);
+                runnable.runFn(runnable);
+            }
+
+            if (pool.is_running) {
+                pool.cond.waitUncancelable(sync_io, &pool.mutex);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Run pending tasks from the queue on the calling thread, then block
+    /// until `wait_group` reaches zero. Mirrors `std.Thread.Pool.waitAndWork`.
+    pub fn waitAndWork(pool: *Pool, wait_group: *WaitGroup) void {
+        while (!wait_group.isDone()) {
+            pool.mutex.lockUncancelable(sync_io);
+            if (pool.run_queue.popFirst()) |run_node| {
+                pool.mutex.unlock(sync_io);
+                const runnable: *Runnable = @fieldParentPtr("node", run_node);
+                runnable.runFn(runnable);
+                continue;
+            }
+
+            pool.mutex.unlock(sync_io);
+            wait_group.wait();
+            return;
+        }
+    }
+};
+
+/// Initialize a thread pool with P-core detection on Linux. Returns null
+/// if the pool cannot be created or if only one core is available.
+///
+/// `n_jobs_override` lets the caller force a specific worker count
+/// (typically resolved from `INFER_THREADS` upstream, where libc and
+/// process env are available). `null` means auto-detect via P-core
+/// detection (Linux) or `getCpuCount() - 1` (other platforms).
+pub fn initPool(allocator: std.mem.Allocator, n_jobs_override: ?usize) ?*Pool {
     const detected = if (comptime builtin.os.tag == .linux)
         detectAndPinPhysicalCores() orelse fallbackWorkerCount()
     else
         fallbackWorkerCount();
 
-    const n_workers = envThreadOverride() orelse detected;
+    const n_workers = n_jobs_override orelse detected;
     if (n_workers == 0) return null;
 
-    const pool = allocator.create(std.Thread.Pool) catch return null;
+    const pool = allocator.create(Pool) catch return null;
     pool.init(.{ .allocator = allocator, .n_jobs = n_workers }) catch {
         allocator.destroy(pool);
         return null;
     };
     return pool;
-}
-
-fn envThreadOverride() ?usize {
-    const heap = std.heap.page_allocator;
-    const raw = std.process.getEnvVarOwned(heap, "INFER_THREADS") catch return null;
-    defer heap.free(raw);
-    const total = std.fmt.parseInt(usize, std.mem.trim(u8, raw, " \t\n\r"), 10) catch return null;
-    if (total == 0) return null;
-    return total - 1;
 }
 
 fn fallbackWorkerCount() usize {
@@ -42,11 +257,11 @@ fn fallbackWorkerCount() usize {
 fn readSysfsUsize(comptime fmt: []const u8, args: anytype) ?usize {
     var path_buf: [128]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, fmt, args) catch return null;
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.openFileAbsolute(sync_io, path, .{}) catch return null;
+    defer file.close(sync_io);
     var buf: [32]u8 = undefined;
-    const len = file.read(&buf) catch return null;
-    const trimmed = std.mem.trimRight(u8, buf[0..len], &.{ '\n', ' ', '\r' });
+    const len = file.readPositional(sync_io, &.{&buf}, 0) catch return null;
+    const trimmed = std.mem.trimEnd(u8, buf[0..len], &.{ '\n', ' ', '\r' });
     return std.fmt.parseInt(usize, trimmed, 10) catch null;
 }
 

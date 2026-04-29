@@ -1,7 +1,8 @@
 const std = @import("std");
+const thread_pool = @import("../thread_pool.zig");
 
-const Pool = std.Thread.Pool;
-const WaitGroup = std.Thread.WaitGroup;
+const Pool = thread_pool.Pool;
+const WaitGroup = thread_pool.WaitGroup;
 
 // ---- Element-wise operations ----
 
