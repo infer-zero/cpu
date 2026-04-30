@@ -7,17 +7,9 @@ pub const Info = struct {
     fit: bool,
 };
 
-/// Lazily resolve a default `Io` for the simple, blocking probes below.
-/// `mem.zig` is invoked from leaf code that does not currently have access
-/// to the upstream `Io`, so we fall back to the stdlib's global single-
-/// threaded instance — adequate for one-off file-stat operations.
-fn defaultIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
-}
-
-pub fn checkModelFitsInMemory(path: []const u8) ?Info {
-    const model_bytes = estimateModelSize(path) orelse return null;
-    const available_bytes = getAvailableMemory() orelse return null;
+pub fn checkModelFitsInMemory(io: std.Io, path: []const u8) ?Info {
+    const model_bytes = estimateModelSize(io, path) orelse return null;
+    const available_bytes = getAvailableMemory(io) orelse return null;
 
     const model_mib = model_bytes / (1024 * 1024);
     const available_mib = available_bytes / (1024 * 1024);
@@ -31,8 +23,7 @@ pub fn checkModelFitsInMemory(path: []const u8) ?Info {
     };
 }
 
-pub fn estimateModelSize(path: []const u8) ?u64 {
-    const io = defaultIo();
+pub fn estimateModelSize(io: std.Io, path: []const u8) ?u64 {
     const cwd = std.Io.Dir.cwd();
 
     // Try as single file (GGUF)
@@ -63,11 +54,10 @@ pub fn estimateModelSize(path: []const u8) ?u64 {
     return if (total > 0) total else null;
 }
 
-pub fn getAvailableMemory() ?u64 {
+pub fn getAvailableMemory(io: std.Io) ?u64 {
     const builtin = @import("builtin");
     if (builtin.os.tag != .linux) return null;
 
-    const io = defaultIo();
     const file = std.Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{}) catch return null;
     defer file.close(io);
 
@@ -76,7 +66,7 @@ pub fn getAvailableMemory() ?u64 {
     const content = buf[0..len];
 
     const needle = "MemAvailable:";
-    const start = std.mem.find(u8, content, needle) orelse return null;
+    const start = std.mem.indexOf(u8, content, needle) orelse return null;
     const rest = content[start + needle.len ..];
 
     // Skip whitespace
@@ -92,14 +82,14 @@ pub fn getAvailableMemory() ?u64 {
 }
 
 test "estimateModelSize returns null for nonexistent path" {
-    const result = estimateModelSize("./nonexistent_model_path_that_does_not_exist");
+    const result = estimateModelSize(std.testing.io, "./nonexistent_model_path_that_does_not_exist");
     try std.testing.expectEqual(null, result);
 }
 
 test "getAvailableMemory returns value on linux" {
     const builtin = @import("builtin");
     if (builtin.os.tag == .linux) {
-        const m = getAvailableMemory();
+        const m = getAvailableMemory(std.testing.io);
         try std.testing.expect(m != null);
         try std.testing.expect(m.? > 0);
     }
