@@ -1,19 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Thread pool used by the CPU matmul kernels. Faithfully ports
-/// `std.Thread.Pool` from Zig 0.15.2 onto the 0.16 sync primitives.
+/// Thread pool used by the CPU matmul kernels. Internal sync primitives
+/// (`Mutex`/`Condition`/`ResetEvent`) use
+/// `std.Io.Threaded.global_single_threaded.io()` — the underlying
+/// `futexWait`/`futexWake` are raw OS syscalls and work across threads
+/// regardless of the Io's task-scheduling mode (the "single-threaded"
+/// namespace refers to async tasks, not kernel mutexes).
 ///
-/// In 0.16 `std.Thread.Pool` was removed and `std.Thread.Mutex`/`Condition`/
-/// `ResetEvent` moved under `std.Io`, requiring an `Io` argument. Because
-/// `infer_cpu` is a leaf package that does not currently receive an `Io`
-/// from upstream, we use `std.Io.Threaded.global_single_threaded` for the
-/// internal sync primitives — the underlying `futexWait`/`futexWake` are
-/// raw OS syscalls and work correctly across threads regardless of the
-/// Io's task-scheduling mode (the "single-threaded" namespace refers to
-/// async tasks, not to kernel mutexes).
-///
-/// Public surface mirrors the 0.15.2 Pool/WaitGroup we depended on:
+/// Public surface:
 ///   * `Pool.threads.len`            — number of background workers
 ///   * `Pool.spawnWg(wg, fn, args)`  — enqueue a task, bumping the wg
 ///   * `Pool.waitAndWork(wg)`        — drain the queue from the main
