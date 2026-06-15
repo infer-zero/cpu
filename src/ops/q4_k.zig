@@ -904,32 +904,33 @@ pub fn quantizeF32ToQ8K(
 ) void {
     @setFloatMode(.optimized);
     const SB = Q4K_BLOCK_SIZE; // 256
+    const V = @Vector(32, f32);
     const num_sb = input.len / SB;
     for (0..num_sb) |sb| {
-        const src = input[sb * SB ..][0..SB];
-        var amax: f32 = 0;
-        for (src) |v| {
-            const a = @abs(v);
-            if (a > amax) amax = a;
+        // Max-abs over the 256-element super-block, vectorized (auto-vec is
+        // off on Zig 0.16, so this must be explicit @Vector).
+        var amax_v: V = @splat(0);
+        inline for (0..8) |g| {
+            const chunk: V = input[sb * SB + g * 32 ..][0..32].*;
+            amax_v = @max(amax_v, @abs(chunk));
         }
+        const amax = @reduce(.Max, amax_v);
         if (amax == 0) {
             @memset(q_vals[sb * SB ..][0..SB], 0);
             q_d[sb] = 0;
             for (0..8) |g| q_bsums[sb * 8 + g] = 0;
             continue;
         }
-        const inv: f32 = 127.0 / amax;
+        const inv: V = @splat(127.0 / amax);
+        const lo: V = @splat(-127.0);
+        const hi: V = @splat(127.0);
         q_d[sb] = amax / 127.0;
-        for (0..8) |g| {
-            var sum: i32 = 0;
-            for (0..32) |t| {
-                const idx = g * 32 + t;
-                const qi: i32 = @intFromFloat(@round(src[idx] * inv));
-                const qc: i8 = @intCast(@max(-127, @min(127, qi)));
-                q_vals[sb * SB + idx] = qc;
-                sum += qc;
-            }
-            q_bsums[sb * 8 + g] = sum;
+        inline for (0..8) |g| {
+            const chunk: V = input[sb * SB + g * 32 ..][0..32].*;
+            const clamped = @max(lo, @min(hi, @round(chunk * inv)));
+            const qi: @Vector(32, i8) = @intFromFloat(clamped);
+            q_vals[sb * SB + g * 32 ..][0..32].* = qi;
+            q_bsums[sb * 8 + g] = @reduce(.Add, @as(@Vector(32, i32), qi));
         }
     }
 }
@@ -985,6 +986,42 @@ inline fn dotQ4_K_q8K_R4(
     return acc;
 }
 
+/// vpmaddubsw: u8 x i8 -> i16 with adjacent pairs summed (32 -> 16 lanes).
+/// Saturating, but Q4_K nibbles (0..15) x Q8 (-127..127) sum to <= 3810, well
+/// within i16, so no saturation occurs in practice.
+inline fn maddubs(a: @Vector(32, u8), b: @Vector(32, i8)) @Vector(16, i16) {
+    if (comptime builtin.cpu.arch == .x86_64 and builtin.mode != .Debug) {
+        return asm ("vpmaddubsw %[b], %[a], %[out]"
+            : [out] "=x" (-> @Vector(16, i16)),
+            : [a] "x" (a),
+              [b] "x" (b),
+        );
+    }
+    var r: [16]i16 = undefined;
+    inline for (0..16) |i| {
+        const p0 = @as(i32, a[2 * i]) * @as(i32, b[2 * i]);
+        const p1 = @as(i32, a[2 * i + 1]) * @as(i32, b[2 * i + 1]);
+        r[i] = @intCast(@max(-32768, @min(32767, p0 + p1)));
+    }
+    return r;
+}
+
+/// vpmaddwd: i16 x i16 -> i32 with adjacent pairs summed (16 -> 8 lanes).
+inline fn maddwd(a: @Vector(16, i16), b: @Vector(16, i16)) @Vector(8, i32) {
+    if (comptime builtin.cpu.arch == .x86_64 and builtin.mode != .Debug) {
+        return asm ("vpmaddwd %[b], %[a], %[out]"
+            : [out] "=x" (-> @Vector(8, i32)),
+            : [a] "x" (a),
+              [b] "x" (b),
+        );
+    }
+    var r: [8]i32 = undefined;
+    inline for (0..8) |i| {
+        r[i] = @as(i32, a[2 * i]) * @as(i32, b[2 * i]) + @as(i32, a[2 * i + 1]) * @as(i32, b[2 * i + 1]);
+    }
+    return r;
+}
+
 /// N-token x 4-row R4 dot with Q8_K activation. Decodes each weight block
 /// (scales, nibbles, f16 deltas) ONCE per (super-block, row) and reuses it
 /// across all N tokens in the tile, so the per-weight unpack work and the L1
@@ -1024,8 +1061,8 @@ inline fn dotQ4_K_q8K_R4xN(
                 const raw: @Vector(32, u8) = (qs + jp * 32)[0..32].*;
                 const lo: @Vector(32, u8) = raw & @as(@Vector(32, u8), @splat(0x0F));
                 const hi: @Vector(32, u8) = raw >> @as(@Vector(32, u8), @splat(4));
-                const slo: @Vector(8, i32) = @splat(@as(i32, sm.scales[jp * 2]));
-                const shi: @Vector(8, i32) = @splat(@as(i32, sm.scales[jp * 2 + 1]));
+                const slo: @Vector(16, i16) = @splat(@as(i16, sm.scales[jp * 2]));
+                const shi: @Vector(16, i16) = @splat(@as(i16, sm.scales[jp * 2 + 1]));
                 const mlo: i32 = sm.mins[jp * 2];
                 const mhi: i32 = sm.mins[jp * 2 + 1];
                 const blk_lo = sb * 8 + jp * 2;
@@ -1034,8 +1071,10 @@ inline fn dotQ4_K_q8K_R4xN(
                 inline for (0..N) |t| {
                     const q8_lo: @Vector(32, i8) = (xv + t * vstride + blk_lo * 32)[0..32].*;
                     const q8_hi: @Vector(32, i8) = (xv + t * vstride + blk_hi * 32)[0..32].*;
-                    sumi[t] += intDotU8xI8(zero, lo, q8_lo) * slo;
-                    sumi[t] += intDotU8xI8(zero, hi, q8_hi) * shi;
+                    // maddubs folds the nibble·q8 product to i16; maddwd applies the
+                    // 6-bit weight scale AND reduces to i32 in one op (no vpmulld).
+                    sumi[t] += maddwd(maddubs(lo, q8_lo), slo);
+                    sumi[t] += maddwd(maddubs(hi, q8_hi), shi);
                     imin[t] += mlo * xb[t * bstride + blk_lo] + mhi * xb[t * bstride + blk_hi];
                 }
             }

@@ -8,13 +8,26 @@ const WaitGroup = thread_pool.WaitGroup;
 
 pub fn rmsNorm(state: []f32, weights: []const f32, epsilon: f32) void {
     @setFloatMode(.optimized);
-    var sum_sq: f32 = 0.0;
-    for (state) |value| sum_sq += value * value;
-    const mean: f32 = sum_sq / @as(f32, @floatFromInt(state.len));
-    const inv_rms: f32 = 1.0 / @sqrt(mean + epsilon);
-    for (state, weights) |*state_val, weight_val| {
-        state_val.* = state_val.* * inv_rms * weight_val;
+    const V = @Vector(8, f32);
+    const n = state.len;
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const s: V = state[i..][0..8].*;
+        acc += s * s;
     }
+    var sum_sq: f32 = @reduce(.Add, acc);
+    while (i < n) : (i += 1) sum_sq += state[i] * state[i];
+    const mean: f32 = sum_sq / @as(f32, @floatFromInt(n));
+    const inv_rms: f32 = 1.0 / @sqrt(mean + epsilon);
+    const ir: V = @splat(inv_rms);
+    i = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const s: V = state[i..][0..8].*;
+        const w: V = weights[i..][0..8].*;
+        state[i..][0..8].* = s * ir * w;
+    }
+    while (i < n) : (i += 1) state[i] = state[i] * inv_rms * weights[i];
 }
 
 /// Per-head RMSNorm: applies RMSNorm independently to each head slice.
@@ -27,16 +40,28 @@ pub fn rmsNormPerHead(
     num_heads: usize,
 ) void {
     @setFloatMode(.optimized);
+    const V = @Vector(8, f32);
     for (0..num_heads) |head| {
         const base = head * head_dim;
         const head_slice = data[base..][0..head_dim];
-        var sum_sq: f32 = 0.0;
-        for (head_slice) |value| sum_sq += value * value;
+        var acc: V = @splat(0);
+        var i: usize = 0;
+        while (i + 8 <= head_dim) : (i += 8) {
+            const s: V = head_slice[i..][0..8].*;
+            acc += s * s;
+        }
+        var sum_sq: f32 = @reduce(.Add, acc);
+        while (i < head_dim) : (i += 1) sum_sq += head_slice[i] * head_slice[i];
         const mean: f32 = sum_sq / @as(f32, @floatFromInt(head_dim));
         const inv_rms: f32 = 1.0 / @sqrt(mean + epsilon);
-        for (head_slice, norm_weights[0..head_dim]) |*sv, wv| {
-            sv.* = sv.* * inv_rms * wv;
+        const ir: V = @splat(inv_rms);
+        i = 0;
+        while (i + 8 <= head_dim) : (i += 8) {
+            const s: V = head_slice[i..][0..8].*;
+            const w: V = norm_weights[i..][0..8].*;
+            head_slice[i..][0..8].* = s * ir * w;
         }
+        while (i < head_dim) : (i += 1) head_slice[i] = head_slice[i] * inv_rms * norm_weights[i];
     }
 }
 
@@ -91,9 +116,17 @@ pub fn scaledAdd(
     scale: f32,
 ) void {
     @setFloatMode(.optimized);
-    for (output, values) |*out_val, val| {
-        out_val.* += val * scale;
+    // Explicit @Vector — Zig 0.16 does not auto-vectorize this scalar loop.
+    const V = @Vector(8, f32);
+    const sv: V = @splat(scale);
+    const n = output.len;
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const o: V = output[i..][0..8].*;
+        const v: V = values[i..][0..8].*;
+        output[i..][0..8].* = o + v * sv;
     }
+    while (i < n) : (i += 1) output[i] += values[i] * scale;
 }
 
 /// Weighted sum of `weights.len` position vectors into `output`.
@@ -149,9 +182,15 @@ pub fn silu(x: f32) f32 {
 
 pub fn addVectors(a: []f32, b: []const f32) void {
     @setFloatMode(.optimized);
-    for (a, b) |*a_val, b_val| {
-        a_val.* += b_val;
+    const V = @Vector(8, f32);
+    const n = a.len;
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const av: V = a[i..][0..8].*;
+        const bv: V = b[i..][0..8].*;
+        a[i..][0..8].* = av + bv;
     }
+    while (i < n) : (i += 1) a[i] += b[i];
 }
 
 pub fn scaleVector(data: []f32, scale: f32) void {
@@ -228,7 +267,16 @@ pub fn matmulF32(
 
 inline fn dotF32(noalias a: [*]const f32, noalias b: [*]const f32, len: usize) f32 {
     @setFloatMode(.optimized);
-    var sum: f32 = 0.0;
-    for (0..len) |i| sum += a[i] * b[i];
+    // Explicit @Vector — Zig 0.16 does not auto-vectorize this reduction.
+    const V = @Vector(8, f32);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + 8 <= len) : (i += 8) {
+        const av: V = (a + i)[0..8].*;
+        const bv: V = (b + i)[0..8].*;
+        acc += av * bv;
+    }
+    var sum: f32 = @reduce(.Add, acc);
+    while (i < len) : (i += 1) sum += a[i] * b[i];
     return sum;
 }
