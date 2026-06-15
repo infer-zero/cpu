@@ -13,6 +13,12 @@ const Q4K_BLOCK_BYTES: usize = 144;
 const Q4K_HEADER_BYTES: usize = 16; // d + dmin + scales
 const Q4K_DATA_BYTES: usize = 128; // qs
 
+/// Tokens dotted per weight-block decode in the Q8_K R4 microkernel. Each
+/// (super-block, row) weight unpack is reused across this many tokens; larger
+/// amortizes the unpack/L1 weight read but needs `TILE` i32 accumulators per
+/// row in the AVX2 register file (16 ymm). 4 is the throughput sweet spot.
+const Q8K_TOKEN_TILE: usize = 4;
+
 /// True when targeting a CPU with 512-bit VNNI (AVX-512 VNNI).
 const has_avx512_vnni = builtin.cpu.arch == .x86_64 and
     std.Target.x86.featureSetHas(builtin.cpu.features, .avx512vnni);
@@ -875,6 +881,483 @@ inline fn dotQ4_K_q8_R4x2(
     }
 
     return .{ acc0, acc1 };
+}
+
+// ---- Q8_K activation path (wider integer-accumulating R4 microkernel) ----
+//
+// The R4 kernels above carry a per-32 f32 activation scale (Q8_0-style), so
+// each 32-element sub-block must be reduced to f32 and scaled immediately --
+// 8 horizontal reductions per super-block. This path instead quantizes the
+// activation Q8_K-style: ONE f32 scale per 256-element super-block plus
+// integer per-32 block sums. That lets the dot accumulate the whole
+// super-block in i32 (the 6-bit weight scales applied in-SIMD) with a single
+// f32 multiply per super-block -- one reduction instead of eight. Mirrors
+// llama.cpp's `ggml_vec_dot_q4_K_q8_K`. Weights are unchanged (same R4 repack).
+
+/// Q8_K-style activation quant: per-256 f32 scale + per-32 i32 block sums.
+/// `q_d` is [in/256], `q_bsums` is [in/256 * 8] (sum of each 32-elem block).
+pub fn quantizeF32ToQ8K(
+    input: []const f32,
+    q_vals: []i8,
+    q_d: []f32,
+    q_bsums: []i32,
+) void {
+    @setFloatMode(.optimized);
+    const SB = Q4K_BLOCK_SIZE; // 256
+    const num_sb = input.len / SB;
+    for (0..num_sb) |sb| {
+        const src = input[sb * SB ..][0..SB];
+        var amax: f32 = 0;
+        for (src) |v| {
+            const a = @abs(v);
+            if (a > amax) amax = a;
+        }
+        if (amax == 0) {
+            @memset(q_vals[sb * SB ..][0..SB], 0);
+            q_d[sb] = 0;
+            for (0..8) |g| q_bsums[sb * 8 + g] = 0;
+            continue;
+        }
+        const inv: f32 = 127.0 / amax;
+        q_d[sb] = amax / 127.0;
+        for (0..8) |g| {
+            var sum: i32 = 0;
+            for (0..32) |t| {
+                const idx = g * 32 + t;
+                const qi: i32 = @intFromFloat(@round(src[idx] * inv));
+                const qc: i8 = @intCast(@max(-127, @min(127, qi)));
+                q_vals[sb * SB + idx] = qc;
+                sum += qc;
+            }
+            q_bsums[sb * 8 + g] = sum;
+        }
+    }
+}
+
+/// 4-row R4 dot with Q8_K activation. Accumulates a whole super-block in i32
+/// (one reduction at the end) per row. Returns 4 dot products.
+inline fn dotQ4_K_q8K_R4(
+    noalias x_vals: [*]const i8,
+    noalias x_d: [*]const f32,
+    noalias x_bsums: [*]const i32,
+    noalias group_ptr: [*]const u8,
+    num_super_blocks: usize,
+) [4]f32 {
+    @setFloatMode(.optimized);
+    @setEvalBranchQuota(50000);
+    const zero: @Vector(8, i32) = @splat(0);
+
+    var acc: [4]f32 = .{ 0, 0, 0, 0 };
+
+    for (0..num_super_blocks) |sb| {
+        const d8 = x_d[sb];
+        inline for (0..4) |row| {
+            const block_ptr = group_ptr + sb * (4 * Q4K_BLOCK_BYTES) + row * Q4K_BLOCK_BYTES;
+            const dw: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[0..2], .little))));
+            const dminw: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[2..4], .little))));
+            const sm = unpackScales(block_ptr[4..16]);
+            const qs = block_ptr + Q4K_HEADER_BYTES;
+
+            var sumi: @Vector(8, i32) = zero;
+            var imin: i32 = 0;
+            inline for (0..4) |jp| {
+                const raw: @Vector(32, u8) = (qs + jp * 32)[0..32].*;
+                const lo: @Vector(32, u8) = raw & @as(@Vector(32, u8), @splat(0x0F));
+                const hi: @Vector(32, u8) = raw >> @as(@Vector(32, u8), @splat(4));
+
+                const blk_lo = sb * 8 + jp * 2;
+                const blk_hi = blk_lo + 1;
+                const q8_lo: @Vector(32, i8) = (x_vals + blk_lo * 32)[0..32].*;
+                const q8_hi: @Vector(32, i8) = (x_vals + blk_hi * 32)[0..32].*;
+
+                sumi += intDotU8xI8(zero, lo, q8_lo) * @as(@Vector(8, i32), @splat(@as(i32, sm.scales[jp * 2])));
+                sumi += intDotU8xI8(zero, hi, q8_hi) * @as(@Vector(8, i32), @splat(@as(i32, sm.scales[jp * 2 + 1])));
+                imin += @as(i32, sm.mins[jp * 2]) * x_bsums[blk_lo];
+                imin += @as(i32, sm.mins[jp * 2 + 1]) * x_bsums[blk_hi];
+            }
+
+            const isum: f32 = @floatFromInt(@reduce(.Add, sumi));
+            const fmin: f32 = @floatFromInt(imin);
+            acc[row] += d8 * (dw * isum - dminw * fmin);
+        }
+    }
+
+    return acc;
+}
+
+/// N-token x 4-row R4 dot with Q8_K activation. Decodes each weight block
+/// (scales, nibbles, f16 deltas) ONCE per (super-block, row) and reuses it
+/// across all N tokens in the tile, so the per-weight unpack work and the L1
+/// weight reads amortize over N tokens instead of 2. Only N i32 accumulators
+/// are live per row (not 4*N), so N can grow to 4-8 within the AVX2 register
+/// file. Tokens are contiguous in the quantized buffers: token t lives at
+/// `xv + t*num_sb*256`, `xd + t*num_sb`, `xb + t*num_sb*8`.
+inline fn dotQ4_K_q8K_R4xN(
+    comptime N: usize,
+    noalias xv: [*]const i8,
+    noalias xd: [*]const f32,
+    noalias xb: [*]const i32,
+    noalias group_ptr: [*]const u8,
+    num_super_blocks: usize,
+) [N][4]f32 {
+    @setFloatMode(.optimized);
+    @setEvalBranchQuota(100000);
+    const zero: @Vector(8, i32) = @splat(0);
+    const vstride = num_super_blocks * Q4K_BLOCK_SIZE;
+    const dstride = num_super_blocks;
+    const bstride = num_super_blocks * 8;
+
+    var acc: [N][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** N;
+
+    for (0..num_super_blocks) |sb| {
+        inline for (0..4) |row| {
+            const block_ptr = group_ptr + sb * (4 * Q4K_BLOCK_BYTES) + row * Q4K_BLOCK_BYTES;
+            const dw: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[0..2], .little))));
+            const dminw: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block_ptr[2..4], .little))));
+            const sm = unpackScales(block_ptr[4..16]);
+            const qs = block_ptr + Q4K_HEADER_BYTES;
+
+            var sumi = [_]@Vector(8, i32){zero} ** N;
+            var imin = [_]i32{0} ** N;
+
+            inline for (0..4) |jp| {
+                const raw: @Vector(32, u8) = (qs + jp * 32)[0..32].*;
+                const lo: @Vector(32, u8) = raw & @as(@Vector(32, u8), @splat(0x0F));
+                const hi: @Vector(32, u8) = raw >> @as(@Vector(32, u8), @splat(4));
+                const slo: @Vector(8, i32) = @splat(@as(i32, sm.scales[jp * 2]));
+                const shi: @Vector(8, i32) = @splat(@as(i32, sm.scales[jp * 2 + 1]));
+                const mlo: i32 = sm.mins[jp * 2];
+                const mhi: i32 = sm.mins[jp * 2 + 1];
+                const blk_lo = sb * 8 + jp * 2;
+                const blk_hi = blk_lo + 1;
+
+                inline for (0..N) |t| {
+                    const q8_lo: @Vector(32, i8) = (xv + t * vstride + blk_lo * 32)[0..32].*;
+                    const q8_hi: @Vector(32, i8) = (xv + t * vstride + blk_hi * 32)[0..32].*;
+                    sumi[t] += intDotU8xI8(zero, lo, q8_lo) * slo;
+                    sumi[t] += intDotU8xI8(zero, hi, q8_hi) * shi;
+                    imin[t] += mlo * xb[t * bstride + blk_lo] + mhi * xb[t * bstride + blk_hi];
+                }
+            }
+
+            inline for (0..N) |t| {
+                const d8 = xd[t * dstride + sb];
+                acc[t][row] += d8 * (dw * @as(f32, @floatFromInt(@reduce(.Add, sumi[t]))) - dminw * @as(f32, @floatFromInt(imin[t])));
+            }
+        }
+    }
+
+    return acc;
+}
+
+/// Q8_K R4 matmul: quantize f32 input (Q8_K), then dispatch the
+/// integer-accumulating R4 dot. `q_d` is [batch * in/256], `q_bsums` is
+/// [batch * in/256 * 8].
+pub fn matmulQ8K_R4(
+    pool: ?*Pool,
+    input: []const f32,
+    w_bytes: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+    q_vals: []i8,
+    q_d: []f32,
+    q_bsums: []i32,
+) void {
+    const num_sb = in_dim / Q4K_BLOCK_SIZE;
+    for (0..batch_size) |t| {
+        quantizeF32ToQ8K(
+            input[t * in_dim ..][0..in_dim],
+            q_vals[t * in_dim ..][0..in_dim],
+            q_d[t * num_sb ..][0..num_sb],
+            q_bsums[t * num_sb * 8 ..][0..num_sb * 8],
+        );
+    }
+
+    const num_groups = (out_dim + 3) / 4;
+
+    const Kernel = struct {
+        fn run(
+            qv: []const i8,
+            qd: []const f32,
+            qb: []const i32,
+            out: []f32,
+            weights: []const u8,
+            output_dim: usize,
+            batch: usize,
+            n_sb: usize,
+            start_group: usize,
+            end_group: usize,
+        ) void {
+            for (start_group..end_group) |group| {
+                const base_row = group * 4;
+                const group_ptr = weights.ptr + group * n_sb * (4 * Q4K_BLOCK_BYTES);
+                var token: usize = 0;
+                while (token + Q8K_TOKEN_TILE <= batch) : (token += Q8K_TOKEN_TILE) {
+                    const r = dotQ4_K_q8K_R4xN(
+                        Q8K_TOKEN_TILE,
+                        qv[token * n_sb * Q4K_BLOCK_SIZE ..].ptr,
+                        qd[token * n_sb ..].ptr,
+                        qb[token * n_sb * 8 ..].ptr,
+                        group_ptr,
+                        n_sb,
+                    );
+                    inline for (0..Q8K_TOKEN_TILE) |tt| {
+                        inline for (0..4) |rr| {
+                            if (base_row + rr < output_dim) out[(token + tt) * output_dim + base_row + rr] = r[tt][rr];
+                        }
+                    }
+                }
+                while (token < batch) : (token += 1) {
+                    const r = dotQ4_K_q8K_R4xN(
+                        1,
+                        qv[token * n_sb * Q4K_BLOCK_SIZE ..].ptr,
+                        qd[token * n_sb ..].ptr,
+                        qb[token * n_sb * 8 ..].ptr,
+                        group_ptr,
+                        n_sb,
+                    );
+                    inline for (0..4) |rr| {
+                        if (base_row + rr < output_dim) out[token * output_dim + base_row + rr] = r[0][rr];
+                    }
+                }
+            }
+        }
+    };
+
+    if (pool) |p| {
+        if (num_groups >= 2) {
+            const num_threads = p.threads.len + 1;
+            const base = num_groups / num_threads;
+            const extra = num_groups % num_threads;
+            var wg: WaitGroup = .{};
+            var start: usize = 0;
+            for (0..num_threads) |ti| {
+                const cnt = base + @intFromBool(ti < extra);
+                if (cnt > 0) {
+                    p.spawnWg(&wg, Kernel.run, .{ q_vals, q_d, q_bsums, output, w_bytes, out_dim, batch_size, num_sb, start, start + cnt });
+                    start += cnt;
+                }
+            }
+            p.waitAndWork(&wg);
+            return;
+        }
+    }
+    Kernel.run(q_vals, q_d, q_bsums, output, w_bytes, out_dim, batch_size, num_sb, 0, num_groups);
+}
+
+/// Fused gate+up (SiLU*hadamard) with Q8_K activation + R4 weights.
+pub fn matmulQ8K_SiluHadamard_R4(
+    pool: ?*Pool,
+    input: []const f32,
+    gate_weights: []const u8,
+    up_weights: []const u8,
+    output: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    batch_size: usize,
+    q_vals: []i8,
+    q_d: []f32,
+    q_bsums: []i32,
+) void {
+    const num_sb = in_dim / Q4K_BLOCK_SIZE;
+    for (0..batch_size) |t| {
+        quantizeF32ToQ8K(
+            input[t * in_dim ..][0..in_dim],
+            q_vals[t * in_dim ..][0..in_dim],
+            q_d[t * num_sb ..][0..num_sb],
+            q_bsums[t * num_sb * 8 ..][0..num_sb * 8],
+        );
+    }
+
+    const num_groups = (out_dim + 3) / 4;
+
+    const Kernel = struct {
+        fn run(
+            qv: []const i8,
+            qd: []const f32,
+            qb: []const i32,
+            out: []f32,
+            gate_w: []const u8,
+            up_w: []const u8,
+            output_dim: usize,
+            batch: usize,
+            n_sb: usize,
+            start_group: usize,
+            end_group: usize,
+        ) void {
+            for (start_group..end_group) |group| {
+                const base_row = group * 4;
+                const gate_ptr = gate_w.ptr + group * n_sb * (4 * Q4K_BLOCK_BYTES);
+                const up_ptr = up_w.ptr + group * n_sb * (4 * Q4K_BLOCK_BYTES);
+                var token: usize = 0;
+                while (token + Q8K_TOKEN_TILE <= batch) : (token += Q8K_TOKEN_TILE) {
+                    const v = qv[token * n_sb * Q4K_BLOCK_SIZE ..].ptr;
+                    const d = qd[token * n_sb ..].ptr;
+                    const b = qb[token * n_sb * 8 ..].ptr;
+                    const g = dotQ4_K_q8K_R4xN(Q8K_TOKEN_TILE, v, d, b, gate_ptr, n_sb);
+                    const u = dotQ4_K_q8K_R4xN(Q8K_TOKEN_TILE, v, d, b, up_ptr, n_sb);
+                    inline for (0..Q8K_TOKEN_TILE) |tt| {
+                        inline for (0..4) |rr| {
+                            if (base_row + rr < output_dim) {
+                                out[(token + tt) * output_dim + base_row + rr] = common.silu(g[tt][rr]) * u[tt][rr];
+                            }
+                        }
+                    }
+                }
+                while (token < batch) : (token += 1) {
+                    const v = qv[token * n_sb * Q4K_BLOCK_SIZE ..].ptr;
+                    const d = qd[token * n_sb ..].ptr;
+                    const b = qb[token * n_sb * 8 ..].ptr;
+                    const g = dotQ4_K_q8K_R4xN(1, v, d, b, gate_ptr, n_sb);
+                    const u = dotQ4_K_q8K_R4xN(1, v, d, b, up_ptr, n_sb);
+                    inline for (0..4) |rr| {
+                        if (base_row + rr < output_dim) out[token * output_dim + base_row + rr] = common.silu(g[0][rr]) * u[0][rr];
+                    }
+                }
+            }
+        }
+    };
+
+    if (pool) |p| {
+        if (num_groups >= 2) {
+            const num_threads = p.threads.len + 1;
+            const base = num_groups / num_threads;
+            const extra = num_groups % num_threads;
+            var wg: WaitGroup = .{};
+            var start: usize = 0;
+            for (0..num_threads) |ti| {
+                const cnt = base + @intFromBool(ti < extra);
+                if (cnt > 0) {
+                    p.spawnWg(&wg, Kernel.run, .{ q_vals, q_d, q_bsums, output, gate_weights, up_weights, out_dim, batch_size, num_sb, start, start + cnt });
+                    start += cnt;
+                }
+            }
+            p.waitAndWork(&wg);
+            return;
+        }
+    }
+    Kernel.run(q_vals, q_d, q_bsums, output, gate_weights, up_weights, out_dim, batch_size, num_sb, 0, num_groups);
+}
+
+test "q8k R4 dot matches scalar dequant reference" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+
+    const in_dim: usize = 512; // 2 super-blocks
+    const num_sb = in_dim / Q4K_BLOCK_SIZE;
+
+    // Random row-major Q4_K weights for 4 rows (one R4 group).
+    const row_bytes = num_sb * Q4K_BLOCK_BYTES;
+    const raw = try allocator.alloc(u8, 4 * row_bytes);
+    defer allocator.free(raw);
+    for (raw) |*b| b.* = rnd.int(u8);
+    // Random bytes make the d/dmin f16 fields possibly NaN/Inf — overwrite
+    // them with finite values so only the scales/nibbles stay random.
+    for (0..4) |row| for (0..num_sb) |sb| {
+        const off = row * row_bytes + sb * Q4K_BLOCK_BYTES;
+        std.mem.writeInt(u16, raw[off..][0..2], @bitCast(@as(f16, @floatCast(rnd.float(f32) * 0.1 + 0.01))), .little);
+        std.mem.writeInt(u16, raw[off + 2 ..][0..2], @bitCast(@as(f16, @floatCast(rnd.float(f32) * 0.05 + 0.01))), .little);
+    };
+
+    // Random f32 input.
+    const input = try allocator.alloc(f32, in_dim);
+    defer allocator.free(input);
+    for (input) |*v| v.* = rnd.float(f32) * 2.0 - 1.0;
+
+    // Quantize input Q8_K.
+    const qv = try allocator.alloc(i8, in_dim);
+    defer allocator.free(qv);
+    const qd = try allocator.alloc(f32, num_sb);
+    defer allocator.free(qd);
+    const qb = try allocator.alloc(i32, num_sb * 8);
+    defer allocator.free(qb);
+    quantizeF32ToQ8K(input, qv, qd, qb);
+
+    // R4-repack weights (repackQ4KR4 frees `raw`, so dupe first).
+    const raw_copy = try allocator.dupe(u8, raw);
+    const packed_w = try repackQ4KR4(allocator, raw_copy, in_dim, 4);
+    defer allocator.free(@constCast(packed_w));
+
+    const simd = dotQ4_K_q8K_R4(qv.ptr, qd.ptr, qb.ptr, packed_w.ptr, num_sb);
+
+    // Scalar reference: dequantize activation (q*d8) and weight, plain f32 dot.
+    for (0..4) |row| {
+        var ref: f32 = 0;
+        for (0..num_sb) |sb| {
+            const block = raw[row * row_bytes + sb * Q4K_BLOCK_BYTES ..][0..Q4K_BLOCK_BYTES];
+            const dw: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[0..2], .little))));
+            const dminw: f32 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, block[2..4], .little))));
+            const sm = unpackScales(block[4..16]);
+            const qs = block[Q4K_HEADER_BYTES..Q4K_BLOCK_BYTES];
+            for (0..4) |jp| {
+                const sc1: f32 = dw * @as(f32, @floatFromInt(sm.scales[jp * 2]));
+                const m1: f32 = dminw * @as(f32, @floatFromInt(sm.mins[jp * 2]));
+                const sc2: f32 = dw * @as(f32, @floatFromInt(sm.scales[jp * 2 + 1]));
+                const m2: f32 = dminw * @as(f32, @floatFromInt(sm.mins[jp * 2 + 1]));
+                for (0..32) |l| {
+                    const byte = qs[jp * 32 + l];
+                    const idx_lo = sb * Q4K_BLOCK_SIZE + jp * 64 + l;
+                    const idx_hi = idx_lo + 32;
+                    const a_lo = @as(f32, @floatFromInt(qv[idx_lo])) * qd[sb];
+                    const a_hi = @as(f32, @floatFromInt(qv[idx_hi])) * qd[sb];
+                    ref += a_lo * (sc1 * @as(f32, @floatFromInt(byte & 0x0F)) - m1);
+                    ref += a_hi * (sc2 * @as(f32, @floatFromInt(byte >> 4)) - m2);
+                }
+            }
+        }
+        try std.testing.expectApproxEqAbs(ref, simd[row], @abs(ref) * 1e-3 + 1e-3);
+    }
+}
+
+test "q8k R4xN matches per-token R4" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xBADF00D);
+    const rnd = prng.random();
+
+    const N = 4;
+    const in_dim: usize = 768; // 3 super-blocks
+    const num_sb = in_dim / Q4K_BLOCK_SIZE;
+    const row_bytes = num_sb * Q4K_BLOCK_BYTES;
+
+    const raw = try allocator.alloc(u8, 4 * row_bytes);
+    defer allocator.free(raw);
+    for (raw) |*b| b.* = rnd.int(u8);
+    for (0..4) |row| for (0..num_sb) |sb| {
+        const off = row * row_bytes + sb * Q4K_BLOCK_BYTES;
+        std.mem.writeInt(u16, raw[off..][0..2], @bitCast(@as(f16, @floatCast(rnd.float(f32) * 0.1 + 0.01))), .little);
+        std.mem.writeInt(u16, raw[off + 2 ..][0..2], @bitCast(@as(f16, @floatCast(rnd.float(f32) * 0.05 + 0.01))), .little);
+    };
+    const packed_w = try repackQ4KR4(allocator, try allocator.dupe(u8, raw), in_dim, 4);
+    defer allocator.free(@constCast(packed_w));
+
+    // N tokens of random input, quantized contiguously.
+    const qv = try allocator.alloc(i8, N * in_dim);
+    defer allocator.free(qv);
+    const qd = try allocator.alloc(f32, N * num_sb);
+    defer allocator.free(qd);
+    const qb = try allocator.alloc(i32, N * num_sb * 8);
+    defer allocator.free(qb);
+    for (0..N) |t| {
+        const input = try allocator.alloc(f32, in_dim);
+        defer allocator.free(input);
+        for (input) |*v| v.* = rnd.float(f32) * 2.0 - 1.0;
+        quantizeF32ToQ8K(input, qv[t * in_dim ..][0..in_dim], qd[t * num_sb ..][0..num_sb], qb[t * num_sb * 8 ..][0..num_sb * 8]);
+    }
+
+    const wide = dotQ4_K_q8K_R4xN(N, qv.ptr, qd.ptr, qb.ptr, packed_w.ptr, num_sb);
+    for (0..N) |t| {
+        const single = dotQ4_K_q8K_R4(
+            qv[t * in_dim ..].ptr,
+            qd[t * num_sb ..].ptr,
+            qb[t * num_sb * 8 ..].ptr,
+            packed_w.ptr,
+            num_sb,
+        );
+        for (0..4) |row| try std.testing.expectApproxEqAbs(single[row], wide[t][row], @abs(single[row]) * 1e-4 + 1e-4);
+    }
 }
 
 // ---- Scalar matmul with f32 input (for MOE variant) ----
