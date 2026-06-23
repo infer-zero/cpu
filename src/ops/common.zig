@@ -1,8 +1,8 @@
 const std = @import("std");
-const thread_pool = @import("../thread_pool.zig");
+const parallel = @import("../parallel.zig");
 
-const Pool = thread_pool.Pool;
-const WaitGroup = thread_pool.WaitGroup;
+const Executor = parallel.Executor;
+const forRange = parallel.forRange;
 
 // ---- Element-wise operations ----
 
@@ -204,7 +204,7 @@ pub fn scaleVector(data: []f32, scale: f32) void {
 
 /// Matmul with F32 weights (for tied embeddings), parallelized.
 pub fn matmulF32(
-    pool: ?*Pool,
+    exec: Executor,
     input: []const f32,
     weights: []const f32,
     output: []f32,
@@ -233,36 +233,14 @@ pub fn matmulF32(
         }
     };
 
-    if (pool) |p| {
-        if (out_dim >= 32) {
-            const num_threads = p.threads.len + 1;
-            const base = out_dim / num_threads;
-            const extra = out_dim % num_threads;
-            var wg: WaitGroup = .{};
-            var start: usize = 0;
-            for (0..num_threads) |thread_index| {
-                const count = base + @intFromBool(thread_index < extra);
-                p.spawnWg(
-                    &wg,
-                    Kernel.run,
-                    .{
-                        input,
-                        output,
-                        weights,
-                        in_dim,
-                        out_dim,
-                        batch_size,
-                        start,
-                        start + count,
-                    },
-                );
-                start += count;
-            }
-            p.waitAndWork(&wg);
-            return;
-        }
-    }
-    Kernel.run(input, output, weights, in_dim, out_dim, batch_size, 0, out_dim);
+    forRange(exec.when(out_dim >= 32), out_dim, Kernel.run, .{
+        input,
+        output,
+        weights,
+        in_dim,
+        out_dim,
+        batch_size,
+    });
 }
 
 inline fn dotF32(noalias a: [*]const f32, noalias b: [*]const f32, len: usize) f32 {

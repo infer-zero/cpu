@@ -1,11 +1,11 @@
 const std = @import("std");
 const common = @import("common.zig");
-const thread_pool = @import("../thread_pool.zig");
+const parallel = @import("../parallel.zig");
 
 pub const DataType = enum { FP32, FP16, BF16 };
 
-const Pool = thread_pool.Pool;
-const WaitGroup = thread_pool.WaitGroup;
+const Executor = parallel.Executor;
+const forRange = parallel.forRange;
 
 // ---- BF16-specific element-wise operations ----
 
@@ -38,7 +38,7 @@ pub fn scaledAddBF16(output: []f32, values: []const u16, scale: f32) void {
 
 /// Matmul dispatching on dtype, parallelized over output rows.
 pub fn matmul(
-    pool: ?*Pool,
+    exec: Executor,
     input: []const f32,
     w_bytes: []const u8,
     output: []f32,
@@ -50,15 +50,15 @@ pub fn matmul(
     switch (dtype) {
         .FP32 => {
             const w: [*]const f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, w_bytes))).ptr;
-            dispatchMatmul(f32, input, output, w, in_dim, out_dim, batch_size, pool);
+            dispatchMatmul(f32, input, output, w, in_dim, out_dim, batch_size, exec);
         },
         .FP16 => {
             const w: [*]const f16 = @as([]const f16, @alignCast(std.mem.bytesAsSlice(f16, w_bytes))).ptr;
-            dispatchMatmul(f16, input, output, w, in_dim, out_dim, batch_size, pool);
+            dispatchMatmul(f16, input, output, w, in_dim, out_dim, batch_size, exec);
         },
         .BF16 => {
             const w: [*]const u16 = @as([]const u16, @alignCast(std.mem.bytesAsSlice(u16, w_bytes))).ptr;
-            dispatchMatmul(u16, input, output, w, in_dim, out_dim, batch_size, pool);
+            dispatchMatmul(u16, input, output, w, in_dim, out_dim, batch_size, exec);
         },
     }
 }
@@ -66,7 +66,7 @@ pub fn matmul(
 /// Fused gate+up projections with SiLU*hadamard, parallelized.
 /// Replaces: matmul(gate) + matmul(up) + siluHadamard(gate, up)
 pub fn matmulSiluHadamard(
-    pool: ?*Pool,
+    exec: Executor,
     input: []const f32,
     gate_w: []const u8,
     up_w: []const u8,
@@ -80,17 +80,17 @@ pub fn matmulSiluHadamard(
         .FP32 => {
             const gw: [*]const f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, gate_w))).ptr;
             const uw: [*]const f32 = @as([]const f32, @alignCast(std.mem.bytesAsSlice(f32, up_w))).ptr;
-            dispatchFusedFFN(f32, input, output, gw, uw, in_dim, out_dim, batch_size, pool);
+            dispatchFusedFFN(f32, input, output, gw, uw, in_dim, out_dim, batch_size, exec);
         },
         .FP16 => {
             const gw: [*]const f16 = @as([]const f16, @alignCast(std.mem.bytesAsSlice(f16, gate_w))).ptr;
             const uw: [*]const f16 = @as([]const f16, @alignCast(std.mem.bytesAsSlice(f16, up_w))).ptr;
-            dispatchFusedFFN(f16, input, output, gw, uw, in_dim, out_dim, batch_size, pool);
+            dispatchFusedFFN(f16, input, output, gw, uw, in_dim, out_dim, batch_size, exec);
         },
         .BF16 => {
             const gw: [*]const u16 = @as([]const u16, @alignCast(std.mem.bytesAsSlice(u16, gate_w))).ptr;
             const uw: [*]const u16 = @as([]const u16, @alignCast(std.mem.bytesAsSlice(u16, up_w))).ptr;
-            dispatchFusedFFN(u16, input, output, gw, uw, in_dim, out_dim, batch_size, pool);
+            dispatchFusedFFN(u16, input, output, gw, uw, in_dim, out_dim, batch_size, exec);
         },
     }
 }
@@ -105,7 +105,7 @@ fn dispatchMatmul(
     input_dim: usize,
     output_dim: usize,
     batch_size: usize,
-    pool: ?*Pool,
+    exec: Executor,
 ) void {
     const Kernel = struct {
         fn run(
@@ -127,23 +127,9 @@ fn dispatchMatmul(
         }
     };
 
-    if (pool) |p| {
-        if (output_dim >= 32) {
-            const num_threads = p.threads.len + 1;
-            const base = output_dim / num_threads;
-            const extra = output_dim % num_threads;
-            var wg: WaitGroup = .{};
-            var start: usize = 0;
-            for (0..num_threads) |thread_index| {
-                const count = base + @intFromBool(thread_index < extra);
-                p.spawnWg(&wg, Kernel.run, .{ batch_in, batch_out, w, input_dim, output_dim, batch_size, start, start + count });
-                start += count;
-            }
-            p.waitAndWork(&wg);
-            return;
-        }
-    }
-    Kernel.run(batch_in, batch_out, w, input_dim, output_dim, batch_size, 0, output_dim);
+    forRange(exec.when(output_dim >= 32), output_dim, Kernel.run, .{
+        batch_in, batch_out, w, input_dim, output_dim, batch_size,
+    });
 }
 
 fn dispatchFusedFFN(
@@ -155,7 +141,7 @@ fn dispatchFusedFFN(
     input_dim: usize,
     output_dim: usize,
     batch_size: usize,
-    pool: ?*Pool,
+    exec: Executor,
 ) void {
     const Kernel = struct {
         fn run(
@@ -183,23 +169,9 @@ fn dispatchFusedFFN(
         }
     };
 
-    if (pool) |p| {
-        if (output_dim >= 32) {
-            const num_threads = p.threads.len + 1;
-            const base = output_dim / num_threads;
-            const extra = output_dim % num_threads;
-            var wg: WaitGroup = .{};
-            var start: usize = 0;
-            for (0..num_threads) |thread_index| {
-                const count = base + @intFromBool(thread_index < extra);
-                p.spawnWg(&wg, Kernel.run, .{ batch_in, batch_out, gate_w, up_w, input_dim, output_dim, batch_size, start, start + count });
-                start += count;
-            }
-            p.waitAndWork(&wg);
-            return;
-        }
-    }
-    Kernel.run(batch_in, batch_out, gate_w, up_w, input_dim, output_dim, batch_size, 0, output_dim);
+    forRange(exec.when(output_dim >= 32), output_dim, Kernel.run, .{
+        batch_in, batch_out, gate_w, up_w, input_dim, output_dim, batch_size,
+    });
 }
 
 // ---- Generic dot product ----

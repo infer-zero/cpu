@@ -1,9 +1,7 @@
-pub const thread_pool = @import("thread_pool.zig");
+pub const parallel = @import("parallel.zig");
 pub const ops = @import("ops/root.zig");
-pub const mem = @import("mem.zig");
 
 test {
-    _ = thread_pool;
+    _ = parallel;
     _ = ops;
-    _ = mem;
 }

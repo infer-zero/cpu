@@ -1,10 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
-const thread_pool = @import("../thread_pool.zig");
+const parallel = @import("../parallel.zig");
 
-const Pool = thread_pool.Pool;
-const WaitGroup = thread_pool.WaitGroup;
+const Executor = parallel.Executor;
+const forRange = parallel.forRange;
 
 /// Number of R4 groups per output tile for batch matmul.
 /// 16 groups = 64 output rows.
@@ -98,7 +98,7 @@ pub fn scaledAddQ8(
 /// Matmul: quantizes f32 inputs, then dispatches integer dot product.
 /// q_vals/q_scales must be pre-allocated with at least batch_size * in_dim / (in_dim/32) elements.
 pub fn matmul(
-    pool: ?*Pool,
+    exec: Executor,
     input: []const f32,
     w_bytes: []const u8,
     output: []f32,
@@ -117,7 +117,7 @@ pub fn matmul(
         );
     }
     matmulQ8(
-        pool,
+        exec,
         q_vals,
         q_scales,
         w_bytes,
@@ -132,7 +132,7 @@ pub fn matmul(
 /// Use when the same quantized input is reused across multiple projections.
 /// Uses tile-based thread distribution for batch>1 and multi-token kernel for 2-token ILP.
 pub fn matmulQ8(
-    pool: ?*Pool,
+    exec: Executor,
     q_vals: []const i8,
     q_scales: []const f32,
     w_bytes: []const u8,
@@ -155,9 +155,9 @@ pub fn matmulQ8(
             output_dim: usize,
             batch: usize,
             num_blocks_inner: usize,
+            eff_tile: usize,
             start_tile: usize,
             end_tile: usize,
-            eff_tile: usize,
         ) void {
             const row_bytes = num_blocks_inner * 18;
             for (start_tile..end_tile) |tile| {
@@ -191,41 +191,7 @@ pub fn matmulQ8(
         }
     };
 
-    if (pool) |p| {
-        if (num_tiles >= 2) {
-            const num_threads = p.threads.len + 1;
-            const base = num_tiles / num_threads;
-            const extra = num_tiles % num_threads;
-            var wg: WaitGroup = .{};
-            var start: usize = 0;
-            for (0..num_threads) |thread_index| {
-                const count = base + @intFromBool(thread_index < extra);
-                if (count > 0) {
-                    p.spawnWg(
-                        &wg,
-                        Kernel.run,
-                        .{
-                            q_vals,
-                            q_scales,
-                            output,
-                            w_bytes,
-                            in_dim,
-                            out_dim,
-                            batch_size,
-                            num_blocks,
-                            start,
-                            start + count,
-                            effective_tile,
-                        },
-                    );
-                    start += count;
-                }
-            }
-            p.waitAndWork(&wg);
-            return;
-        }
-    }
-    Kernel.run(
+    forRange(exec, num_tiles, Kernel.run, .{
         q_vals,
         q_scales,
         output,
@@ -234,16 +200,14 @@ pub fn matmulQ8(
         out_dim,
         batch_size,
         num_blocks,
-        0,
-        num_tiles,
         effective_tile,
-    );
+    });
 }
 
 /// Fused gate+up projections with SiLU*hadamard, parallelized.
 /// Quantizes f32 inputs, then dispatches integer dot product.
 pub fn matmulSiluHadamard(
-    pool: ?*Pool,
+    exec: Executor,
     input: []const f32,
     gate_weights: []const u8,
     up_weights: []const u8,
@@ -263,7 +227,7 @@ pub fn matmulSiluHadamard(
         );
     }
     matmulSiluHadamardQ8(
-        pool,
+        exec,
         q_vals,
         q_scales,
         gate_weights,
@@ -278,7 +242,7 @@ pub fn matmulSiluHadamard(
 /// Fused gate+up with SiLU*hadamard using pre-quantized i8 input.
 /// Uses tile-based thread distribution for batch>1 and multi-token kernel for 2-token ILP.
 fn matmulSiluHadamardQ8(
-    pool: ?*Pool,
+    exec: Executor,
     q_vals: []const i8,
     q_scales: []const f32,
     gate_weights: []const u8,
@@ -303,9 +267,9 @@ fn matmulSiluHadamardQ8(
             output_dim: usize,
             batch: usize,
             num_blocks_inner: usize,
+            eff_tile: usize,
             start_tile: usize,
             end_tile: usize,
-            eff_tile: usize,
         ) void {
             @setFloatMode(.optimized);
             const row_bytes = num_blocks_inner * 18;
@@ -340,42 +304,7 @@ fn matmulSiluHadamardQ8(
         }
     };
 
-    if (pool) |p| {
-        if (num_tiles >= 2) {
-            const num_threads = p.threads.len + 1;
-            const base = num_tiles / num_threads;
-            const extra = num_tiles % num_threads;
-            var wg: WaitGroup = .{};
-            var start: usize = 0;
-            for (0..num_threads) |thread_index| {
-                const count = base + @intFromBool(thread_index < extra);
-                if (count > 0) {
-                    p.spawnWg(
-                        &wg,
-                        Kernel.run,
-                        .{
-                            q_vals,
-                            q_scales,
-                            output,
-                            gate_weights,
-                            up_weights,
-                            in_dim,
-                            out_dim,
-                            batch_size,
-                            num_blocks,
-                            start,
-                            start + count,
-                            effective_tile,
-                        },
-                    );
-                    start += count;
-                }
-            }
-            p.waitAndWork(&wg);
-            return;
-        }
-    }
-    Kernel.run(
+    forRange(exec, num_tiles, Kernel.run, .{
         q_vals,
         q_scales,
         output,
@@ -385,17 +314,15 @@ fn matmulSiluHadamardQ8(
         out_dim,
         batch_size,
         num_blocks,
-        0,
-        num_tiles,
         effective_tile,
-    );
+    });
 }
 
 // ---- R4 matmul (4-row interleaved) ----
 
 /// Matmul with R4-interleaved weights: quantizes f32 input, then dispatches R4 kernel.
 pub fn matmulR4(
-    pool: ?*Pool,
+    exec: Executor,
     input: []const f32,
     w_bytes: []const u8,
     output: []f32,
@@ -413,14 +340,14 @@ pub fn matmulR4(
             q_scales[token * num_blocks ..][0..num_blocks],
         );
     }
-    matmulQ8R4(pool, q_vals, q_scales, w_bytes, output, in_dim, out_dim, batch_size);
+    matmulQ8R4(exec, q_vals, q_scales, w_bytes, output, in_dim, out_dim, batch_size);
 }
 
 /// Matmul with pre-quantized i8 input and R4-interleaved Q4_0 weights.
 /// Groups of 4 rows are interleaved at block granularity for better cache utilization.
 /// Uses tile-based thread distribution for batch>1 and multi-token kernel for 2-token ILP.
 pub fn matmulQ8R4(
-    pool: ?*Pool,
+    exec: Executor,
     q_vals: []const i8,
     q_scales: []const f32,
     w_bytes: []const u8,
@@ -444,10 +371,10 @@ pub fn matmulQ8R4(
             output_dim: usize,
             batch: usize,
             nblocks: usize,
-            start_tile: usize,
-            end_tile: usize,
             t_groups: usize,
             total_groups: usize,
+            start_tile: usize,
+            end_tile: usize,
         ) void {
             if (batch > 2) {
                 runDequant(
@@ -600,38 +527,7 @@ pub fn matmulQ8R4(
         }
     };
 
-    if (pool) |p| {
-        if (num_tiles >= 2) {
-            const num_threads = p.threads.len + 1;
-            const base = num_tiles / num_threads;
-            const extra = num_tiles % num_threads;
-            var wg: WaitGroup = .{};
-            var start: usize = 0;
-            for (0..num_threads) |thread_index| {
-                const count = base + @intFromBool(thread_index < extra);
-                if (count > 0) {
-                    p.spawnWg(&wg, Kernel.run, .{
-                        q_vals,
-                        q_scales,
-                        output,
-                        w_bytes,
-                        in_dim,
-                        out_dim,
-                        batch_size,
-                        num_blocks,
-                        start,
-                        start + count,
-                        effective_tile,
-                        num_groups,
-                    });
-                    start += count;
-                }
-            }
-            p.waitAndWork(&wg);
-            return;
-        }
-    }
-    Kernel.run(
+    forRange(exec, num_tiles, Kernel.run, .{
         q_vals,
         q_scales,
         output,
@@ -640,16 +536,14 @@ pub fn matmulQ8R4(
         out_dim,
         batch_size,
         num_blocks,
-        0,
-        num_tiles,
         effective_tile,
         num_groups,
-    );
+    });
 }
 
 /// Fused gate+up projections with SiLU*hadamard using R4-interleaved weights.
 pub fn matmulSiluHadamardR4(
-    pool: ?*Pool,
+    exec: Executor,
     input: []const f32,
     gate_weights: []const u8,
     up_weights: []const u8,
@@ -669,7 +563,7 @@ pub fn matmulSiluHadamardR4(
         );
     }
     matmulSiluHadamardQ8R4(
-        pool,
+        exec,
         q_vals,
         q_scales,
         gate_weights,
@@ -684,7 +578,7 @@ pub fn matmulSiluHadamardR4(
 /// Fused gate+up with SiLU*hadamard using pre-quantized i8 input and R4-interleaved weights.
 /// Uses tile-based thread distribution for batch>1 and multi-token kernel for 2-token ILP.
 fn matmulSiluHadamardQ8R4(
-    pool: ?*Pool,
+    exec: Executor,
     q_vals: []const i8,
     q_scales: []const f32,
     gate_weights: []const u8,
@@ -710,10 +604,10 @@ fn matmulSiluHadamardQ8R4(
             output_dim: usize,
             batch: usize,
             nblocks: usize,
-            start_tile: usize,
-            end_tile: usize,
             t_groups: usize,
             total_groups: usize,
+            start_tile: usize,
+            end_tile: usize,
         ) void {
             if (batch > 2) {
                 runDequant(
@@ -910,43 +804,7 @@ fn matmulSiluHadamardQ8R4(
         }
     };
 
-    if (pool) |p| {
-        if (num_tiles >= 2) {
-            const num_threads = p.threads.len + 1;
-            const base = num_tiles / num_threads;
-            const extra = num_tiles % num_threads;
-            var wg: WaitGroup = .{};
-            var start: usize = 0;
-            for (0..num_threads) |thread_index| {
-                const count = base + @intFromBool(thread_index < extra);
-                if (count > 0) {
-                    p.spawnWg(
-                        &wg,
-                        Kernel.run,
-                        .{
-                            q_vals,
-                            q_scales,
-                            output,
-                            gate_weights,
-                            up_weights,
-                            in_dim,
-                            out_dim,
-                            batch_size,
-                            num_blocks,
-                            start,
-                            start + count,
-                            effective_tile,
-                            num_groups,
-                        },
-                    );
-                    start += count;
-                }
-            }
-            p.waitAndWork(&wg);
-            return;
-        }
-    }
-    Kernel.run(
+    forRange(exec, num_tiles, Kernel.run, .{
         q_vals,
         q_scales,
         output,
@@ -956,11 +814,9 @@ fn matmulSiluHadamardQ8R4(
         out_dim,
         batch_size,
         num_blocks,
-        0,
-        num_tiles,
         effective_tile,
         num_groups,
-    );
+    });
 }
 
 // ---- Dot product kernels ----
