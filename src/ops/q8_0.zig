@@ -504,7 +504,7 @@ fn matmulSiluHadamardQ8R4(
 /// a multiple of 4. `num_blocks` (= in_dim / 32) must be a multiple of
 /// 4 — every CPU Q8_0 model variant we care about has dim divisible by
 /// 128, so this is always true in practice. Frees `raw`.
-pub fn repackQ8X4(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) ![]u8 {
+pub fn repackQ8X4(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) error{OutOfMemory}![]u8 {
     const src_block_size = 34; // 2B f16 scale + 32B i8 quants
     const num_blocks = in_dim / 32;
     std.debug.assert(num_blocks % 4 == 0);

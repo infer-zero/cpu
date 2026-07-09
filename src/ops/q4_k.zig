@@ -293,9 +293,8 @@ pub fn matmulQ8(
     };
 
     forRange(exec, num_tiles, Kernel.run, .{
-        q_vals, q_scales, block_sums, output, w_bytes,
-        out_dim, batch_size,
-        num_q8_blocks, num_super_blocks, row_bytes,
+        q_vals,  q_scales,   block_sums,    output,           w_bytes,
+        out_dim, batch_size, num_q8_blocks, num_super_blocks, row_bytes,
     });
 }
 
@@ -401,9 +400,8 @@ pub fn matmulSiluHadamardQ8(
     };
 
     forRange(exec, num_tiles, Kernel.run, .{
-        q_vals, q_scales, block_sums, output, gate_weights, up_weights,
-        out_dim, batch_size,
-        num_q8_blocks, num_super_blocks, row_bytes,
+        q_vals,  q_scales,   block_sums,    output,           gate_weights, up_weights,
+        out_dim, batch_size, num_q8_blocks, num_super_blocks, row_bytes,
     });
 }
 
@@ -412,7 +410,7 @@ pub fn matmulSiluHadamardQ8(
 /// Repack Q4_K weights from row-major to R4 (4-row interleaved) layout.
 /// Groups of 4 rows have their super-blocks interleaved at block granularity.
 /// Caller must free the returned slice. Frees the input `raw` slice.
-pub fn repackQ4KR4(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) ![]const u8 {
+pub fn repackQ4KR4(allocator: std.mem.Allocator, raw: []const u8, in_dim: usize, out_dim: usize) error{OutOfMemory}![]const u8 {
     const num_super_blocks = in_dim / Q4K_BLOCK_SIZE;
     const row_bytes = num_super_blocks * Q4K_BLOCK_BYTES;
     const padded_out_dim = (out_dim + 3) / 4 * 4;
@@ -548,10 +546,8 @@ pub fn matmulQ8R4(
     };
 
     forRange(exec, num_tiles, Kernel.run, .{
-        q_vals, q_scales, block_sums, output, w_bytes,
-        out_dim, batch_size,
-        num_q8_blocks, num_super_blocks,
-        num_groups,
+        q_vals,  q_scales,   block_sums,    output,           w_bytes,
+        out_dim, batch_size, num_q8_blocks, num_super_blocks, num_groups,
     });
 }
 
@@ -664,9 +660,8 @@ pub fn matmulSiluHadamardQ8R4(
     };
 
     forRange(exec, num_tiles, Kernel.run, .{
-        q_vals, q_scales, block_sums, output, gate_weights, up_weights,
-        out_dim, batch_size,
-        num_q8_blocks, num_super_blocks,
+        q_vals,  q_scales,   block_sums,    output,           gate_weights, up_weights,
+        out_dim, batch_size, num_q8_blocks, num_super_blocks,
     });
 }
 
@@ -1015,7 +1010,7 @@ pub fn matmulQ8K_R4(
             input[t * in_dim ..][0..in_dim],
             q_vals[t * in_dim ..][0..in_dim],
             q_d[t * num_sb ..][0..num_sb],
-            q_bsums[t * num_sb * 8 ..][0..num_sb * 8],
+            q_bsums[t * num_sb * 8 ..][0 .. num_sb * 8],
         );
     }
 
@@ -1093,7 +1088,7 @@ pub fn matmulQ8K_SiluHadamard_R4(
             input[t * in_dim ..][0..in_dim],
             q_vals[t * in_dim ..][0..in_dim],
             q_d[t * num_sb ..][0..num_sb],
-            q_bsums[t * num_sb * 8 ..][0..num_sb * 8],
+            q_bsums[t * num_sb * 8 ..][0 .. num_sb * 8],
         );
     }
 
@@ -1252,7 +1247,7 @@ test "q8k R4xN matches per-token R4" {
         const input = try allocator.alloc(f32, in_dim);
         defer allocator.free(input);
         for (input) |*v| v.* = rnd.float(f32) * 2.0 - 1.0;
-        quantizeF32ToQ8K(input, qv[t * in_dim ..][0..in_dim], qd[t * num_sb ..][0..num_sb], qb[t * num_sb * 8 ..][0..num_sb * 8]);
+        quantizeF32ToQ8K(input, qv[t * in_dim ..][0..in_dim], qd[t * num_sb ..][0..num_sb], qb[t * num_sb * 8 ..][0 .. num_sb * 8]);
     }
 
     const wide = dotQ4_K_q8K_R4xN(N, qv.ptr, qd.ptr, qb.ptr, packed_w.ptr, num_sb);
